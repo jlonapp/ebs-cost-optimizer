@@ -1,0 +1,11 @@
+# EBS Right-Sizer dependencies
+#
+# Option A — Amazon Linux package manager (recommended on EC2):
+#   AL2023:  sudo dnf install -y python3-boto3
+#   AL2:     sudo yum install -y python3-boto3
+#
+# Option B — pip (any OS, optionally inside a virtualenv):
+#   pip3 install -r requirements.txt
+#
+# Only boto3 is required. botocore is pulled in as a transitive dependency.
+boto3>=1.26.0

@@ -1,0 +1,24 @@
+# Generated report output
+ebs_rightsizing_report.csv
+*.csv
+
+# Approved volume lists may carry sensitive identifiers
+approved_volumes.txt
+*.local.txt
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+.python-version
+
+# Editor / OS noise
+.DS_Store
+.idea/
+.vscode/
+*.swp
+
+# Temp files from atomic writes
+*.tmp
