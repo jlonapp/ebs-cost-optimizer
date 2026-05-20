@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import json
 import logging
 import math
 import os
@@ -57,6 +58,16 @@ TYPE_LIMITS: Dict[str, Dict[str, int]] = {
     "io2": {"max_iops": 256000, "max_throughput": 4000},
 }
 TUNABLE_TYPES = frozenset(TYPE_LIMITS)
+
+# gp3 pricing model (USD per month). Defaults match AWS list prices in
+# us-east-1 as of late 2025. Storage = $/GiB-month; IOPS over 3000 =
+# $/provisioned-IOPS-month; throughput over 125 = $/MiB/s-month.
+# Prices vary by region; override via --pricing-file or --price-* flags.
+DEFAULT_PRICING_GP3: Dict[str, float] = {
+    "storage_per_gib_month": 0.08,
+    "iops_per_iop_month_over_3000": 0.005,
+    "throughput_per_mibps_month_over_125": 0.04,
+}
 
 # CloudWatch retains 5-minute resolution metrics for 63 days.
 MAX_LOOKBACK_DAYS = 63
@@ -98,6 +109,10 @@ class VolumeReport:
     target_throughput_mibps: Optional[int]
     direction: str  # UPSIZE | DOWNSIZE | NONE
     action: str
+    monthly_cost_current_usd: float = 0.0
+    monthly_cost_target_usd: float = 0.0
+    monthly_delta_usd: float = 0.0   # target - current; negative = savings
+    annual_delta_usd: float = 0.0
     modification_state: str = ""
     co_finding_reasons: str = ""
     category: str = "rightsizing"  # or "orphan"
@@ -127,6 +142,18 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
                    help=f"Parallel CloudWatch workers (default {DEFAULT_MAX_WORKERS})")
     p.add_argument("--output", default="ebs_rightsizing_report.csv",
                    help="CSV report output path")
+
+    # Pricing (gp3)
+    p.add_argument("--pricing-file",
+                   help="JSON file with keys: storage_per_gib_month, "
+                        "iops_per_iop_month_over_3000, "
+                        "throughput_per_mibps_month_over_125")
+    p.add_argument("--price-storage", type=float, default=None,
+                   help="Override gp3 storage price ($/GiB-month)")
+    p.add_argument("--price-iops", type=float, default=None,
+                   help="Override gp3 IOPS price ($/IOP-month above 3000)")
+    p.add_argument("--price-throughput", type=float, default=None,
+                   help="Override gp3 throughput price ($/MiB/s-month above 125)")
 
     # Orphan options
     p.add_argument("--include-orphans", action="store_true",
@@ -448,6 +475,46 @@ def compute_target(volume_type: str,
 
 
 # ---------------------------------------------------------------------------
+# Pricing
+# ---------------------------------------------------------------------------
+
+def load_pricing(args: argparse.Namespace) -> Dict[str, float]:
+    """Resolve gp3 pricing in this order: defaults <- pricing file <- CLI overrides."""
+    pricing = dict(DEFAULT_PRICING_GP3)
+    if args.pricing_file:
+        try:
+            with open(args.pricing_file, "r", encoding="utf-8") as fh:
+                data = json.load(fh)
+        except (OSError, json.JSONDecodeError) as exc:
+            log.error("Cannot read --pricing-file: %s", exc)
+            sys.exit(2)
+        for key in pricing:
+            if key in data:
+                try:
+                    pricing[key] = float(data[key])
+                except (TypeError, ValueError):
+                    log.error("Pricing file key %r must be numeric", key)
+                    sys.exit(2)
+    if args.price_storage is not None:
+        pricing["storage_per_gib_month"] = args.price_storage
+    if args.price_iops is not None:
+        pricing["iops_per_iop_month_over_3000"] = args.price_iops
+    if args.price_throughput is not None:
+        pricing["throughput_per_mibps_month_over_125"] = args.price_throughput
+    return pricing
+
+
+def gp3_monthly_cost(size_gib: int, iops: int, throughput_mibps: int,
+                     pricing: Dict[str, float]) -> float:
+    """Compute monthly USD cost for a gp3 volume. AWS only bills for IOPS over
+    3000 and throughput over 125 MiB/s; baseline is included in storage."""
+    storage = max(0, size_gib) * pricing["storage_per_gib_month"]
+    extra_iops = max(0, iops - 3000) * pricing["iops_per_iop_month_over_3000"]
+    extra_tput = max(0, throughput_mibps - 125) * pricing["throughput_per_mibps_month_over_125"]
+    return round(storage + extra_iops + extra_tput, 2)
+
+
+# ---------------------------------------------------------------------------
 # Apply
 # ---------------------------------------------------------------------------
 
@@ -483,9 +550,19 @@ def confirm_apply(scope_count: int, applying_to_all: bool, assume_yes: bool) -> 
 # ---------------------------------------------------------------------------
 
 def sanitize_for_csv(value) -> str:
-    """Mitigate CSV/spreadsheet formula injection."""
+    """Mitigate CSV/spreadsheet formula injection.
+
+    Pure numeric values (int/float) are emitted as-is; the formula-injection
+    risk only applies to string content. For string values, prefix any cell
+    starting with =, +, -, @, tab, or CR with a single quote so spreadsheet
+    apps don't treat it as a formula.
+    """
     if value is None:
         return ""
+    if isinstance(value, bool):
+        return str(value)
+    if isinstance(value, (int, float)):
+        return str(value)
     s = str(value)
     if s and s[0] in CSV_INJECTION_TRIGGERS:
         return "'" + s
@@ -514,7 +591,8 @@ def write_report(rows: List[VolumeReport], path: str) -> None:
 def analyze_rightsizing(args: argparse.Namespace,
                         ec2, cw, co,
                         account_id: str,
-                        scope_ids: Optional[List[str]]) -> List[VolumeReport]:
+                        scope_ids: Optional[List[str]],
+                        pricing: Dict[str, float]) -> List[VolumeReport]:
     log.info("Fetching Compute Optimizer EBS recommendations...")
     findings = get_compute_optimizer_findings(co, account_id)
     log.info("Compute Optimizer flagged %d volumes as NotOptimized.", len(findings))
@@ -566,7 +644,7 @@ def analyze_rightsizing(args: argparse.Namespace,
         peak_iops, peak_tput, n_points = peaks.get(vol_id, (0.0, 0.0, 0))
 
         if not vol:
-            rows.append(VolumeReport(
+            missing_row = VolumeReport(
                 volume_id=vol_id,
                 volume_type="?",
                 size_gib=0,
@@ -583,10 +661,12 @@ def analyze_rightsizing(args: argparse.Namespace,
                 action="SKIP - volume not found (deleted?)",
                 co_finding_reasons=";".join(rec.get("findingReasonCodes", [])) if rec else "",
                 notes=f"datapoints={n_points}",
-            ))
+            )
+            _populate_cost_columns(missing_row, pricing)
+            rows.append(missing_row)
             continue
 
-        rows.append(_build_rightsizing_row(vol, rec, peak_iops, peak_tput, n_points, args))
+        rows.append(_build_rightsizing_row(vol, rec, peak_iops, peak_tput, n_points, args, pricing))
 
     # Direction filter applies after rows are built so SKIP/NO_CHANGE are kept
     # for visibility but MODIFY rows can be narrowed.
@@ -598,10 +678,32 @@ def analyze_rightsizing(args: argparse.Namespace,
     return rows
 
 
+def _populate_cost_columns(row: VolumeReport, pricing: Dict[str, float]) -> None:
+    """Fill monthly_cost_* columns. Only gp3 has a pricing model here; for
+    other types we leave the columns at 0.0 to avoid misleading the reader."""
+    if row.volume_type != "gp3":
+        return
+    cur_cost = gp3_monthly_cost(row.size_gib, row.current_iops,
+                                row.current_throughput_mibps, pricing)
+    row.monthly_cost_current_usd = cur_cost
+    if row.target_iops is not None and row.target_throughput_mibps is not None:
+        tgt_cost = gp3_monthly_cost(row.size_gib, row.target_iops,
+                                    row.target_throughput_mibps, pricing)
+        row.monthly_cost_target_usd = tgt_cost
+        row.monthly_delta_usd = round(tgt_cost - cur_cost, 2)
+        row.annual_delta_usd = round(row.monthly_delta_usd * 12, 2)
+    else:
+        # No target (orphan or skipped). Leave delta at 0.
+        row.monthly_cost_target_usd = cur_cost
+        row.monthly_delta_usd = 0.0
+        row.annual_delta_usd = 0.0
+
+
 def _build_rightsizing_row(vol: dict, rec: dict,
                            peak_iops: float, peak_tput: float,
                            n_points: int,
-                           args: argparse.Namespace) -> VolumeReport:
+                           args: argparse.Namespace,
+                           pricing: Dict[str, float]) -> VolumeReport:
     vol_type = vol["VolumeType"]
     cur_iops = vol.get("Iops", 0)
     cur_tput = vol.get("Throughput", 0)
@@ -630,10 +732,12 @@ def _build_rightsizing_row(vol: dict, rec: dict,
 
     if vol_type not in TUNABLE_TYPES:
         base.action = f"SKIP - {vol_type} not directly tunable; migrate to gp3 first"
+        _populate_cost_columns(base, pricing)
         return base
 
     if n_points == 0:
         base.action = "SKIP - no CloudWatch data in lookback window"
+        _populate_cost_columns(base, pricing)
         return base
 
     target_iops, target_tput = compute_target(
@@ -647,6 +751,7 @@ def _build_rightsizing_row(vol: dict, rec: dict,
     tput_changed = (vol_type == "gp3") and (target_tput != cur_tput)
     if not (iops_changed or tput_changed):
         base.action = "NO_CHANGE - already matches target"
+        _populate_cost_columns(base, pricing)
         return base
 
     delta_iops = target_iops - cur_iops
@@ -659,11 +764,13 @@ def _build_rightsizing_row(vol: dict, rec: dict,
         direction = "NONE"
     base.direction = direction
     base.action = f"MODIFY {direction} (Δ {delta_iops:+d} IOPS, {delta_tput:+d} MiB/s)"
+    _populate_cost_columns(base, pricing)
     return base
 
 
 def analyze_orphans(ec2, args: argparse.Namespace,
-                    scope_ids: Optional[List[str]]) -> List[VolumeReport]:
+                    scope_ids: Optional[List[str]],
+                    pricing: Dict[str, float]) -> List[VolumeReport]:
     log.info("Scanning for orphan (unattached) EBS volumes...")
     orphans = describe_orphan_volumes(ec2)
     if scope_ids is not None:
@@ -708,6 +815,14 @@ def analyze_orphans(ec2, args: argparse.Namespace,
             category="orphan",
             notes=notes,
         ))
+    # For orphans, "delta" represents potential savings if deleted: target=0
+    for r in rows:
+        if r.volume_type == "gp3":
+            r.monthly_cost_current_usd = gp3_monthly_cost(
+                r.size_gib, r.current_iops, r.current_throughput_mibps, pricing)
+            r.monthly_cost_target_usd = 0.0
+            r.monthly_delta_usd = round(-r.monthly_cost_current_usd, 2)
+            r.annual_delta_usd = round(r.monthly_delta_usd * 12, 2)
     return rows
 
 
@@ -781,13 +896,26 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     cw = session.client("cloudwatch", config=cfg)
     co = session.client("compute-optimizer", config=cfg)
 
+    pricing = load_pricing(args)
+    log.info("Pricing model (gp3, USD): storage=$%.4f/GiB-mo, "
+             "iops=$%.4f/IOP-mo over 3000, throughput=$%.4f/MiB/s-mo over 125",
+             pricing["storage_per_gib_month"],
+             pricing["iops_per_iop_month_over_3000"],
+             pricing["throughput_per_mibps_month_over_125"])
+
     rows: List[VolumeReport] = []
 
     if not args.orphans_only:
-        rows.extend(analyze_rightsizing(args, ec2, cw, co, account_id, scope_ids))
+        rows.extend(analyze_rightsizing(args, ec2, cw, co, account_id, scope_ids, pricing))
 
     if args.include_orphans or args.orphans_only:
-        rows.extend(analyze_orphans(ec2, args, scope_ids))
+        orphan_rows = analyze_orphans(ec2, args, scope_ids, pricing)
+        # Dedup: if a volume appears in both rightsizing and orphan paths
+        # (rare but possible), keep the orphan row since deletion is the
+        # more impactful recommendation.
+        orphan_ids = {o.volume_id for o in orphan_rows}
+        rows = [r for r in rows if r.volume_id not in orphan_ids]
+        rows.extend(orphan_rows)
 
     if not rows:
         log.info("No volumes in scope. Nothing to do.")
@@ -807,23 +935,55 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             if r.action.startswith("MODIFY"):
                 r.modification_state = "DRY_RUN"
 
-    write_report(rows, args.output)
+    write_report(_sort_rows(rows), args.output)
 
     # Summary
     counts = {"MODIFY": 0, "NO_CHANGE": 0, "SKIP": 0, "ORPHAN": 0}
+    monthly_savings = 0.0
+    monthly_added = 0.0
+    orphan_savings = 0.0
     for r in rows:
         for key in counts:
             if r.action.startswith(key):
                 counts[key] += 1
                 break
+        if r.category == "orphan":
+            orphan_savings += -r.monthly_delta_usd
+        elif r.action.startswith("MODIFY"):
+            if r.monthly_delta_usd < 0:
+                monthly_savings += -r.monthly_delta_usd
+            elif r.monthly_delta_usd > 0:
+                monthly_added += r.monthly_delta_usd
+
     log.info("Summary: modify=%d, no_change=%d, skip=%d, orphan=%d",
              counts["MODIFY"], counts["NO_CHANGE"], counts["SKIP"], counts["ORPHAN"])
+    log.info("Estimated monthly impact: savings=$%.2f, added=$%.2f, "
+             "net=$%+.2f (annualized $%+.2f). Orphan deletion savings=$%.2f/mo.",
+             monthly_savings, monthly_added,
+             monthly_added - monthly_savings,
+             (monthly_added - monthly_savings) * 12,
+             orphan_savings)
 
     if not args.apply and counts["MODIFY"]:
         log.info("Re-run with --apply (and --volume-ids / --apply-all) to push changes.")
 
     failed = sum(1 for r in rows if r.modification_state == "FAILED")
     return 1 if failed else 0
+
+
+def _sort_rows(rows: List[VolumeReport]) -> List[VolumeReport]:
+    """Sort by attached_instances so volumes on the same EC2 group together.
+    Orphans (empty attached_instances) sink to the bottom. Within an instance,
+    sort by volume_id for deterministic output."""
+    return sorted(
+        rows,
+        key=lambda r: (
+            r.category == "orphan",                # rightsizing first, orphans last
+            r.attached_instances == "",            # attached first, unattached after
+            r.attached_instances.lower(),
+            r.volume_id,
+        ),
+    )
 
 
 if __name__ == "__main__":

@@ -16,8 +16,13 @@ typically dominate idle-resource spend.
 4. Compares against current `Iops` / `Throughput` from `DescribeVolumes`.
 5. Calculates target = `peak * (1 + buffer%)`, floored at gp3 baseline,
    capped at the volume type's service limit.
-6. Optionally lists orphan volumes (state `available`).
-7. Writes a CSV report. With `--apply` plus an explicit scope, calls
+6. Estimates monthly and annual cost impact for each row using a
+   configurable gp3 pricing model.
+7. Optionally lists orphan volumes (state `available`) with monthly cost as
+   the savings if deleted.
+8. Sorts the report by attached EC2 instance so volumes on the same host
+   group together; orphans appear last.
+9. Writes a CSV report. With `--apply` plus an explicit scope, calls
    `ec2:ModifyVolume`.
 
 ## Volume types
@@ -102,6 +107,68 @@ Tune lookback and buffer:
 python ebs_rightsizer.py --region us-east-1 --days 40 --buffer 30
 ```
 
+## Pricing model
+
+Each row carries four cost columns so the financial impact is visible per
+volume and at the run-level summary:
+
+| Column | Meaning |
+|--------|---------|
+| `monthly_cost_current_usd` | Estimated monthly cost at current provisioning |
+| `monthly_cost_target_usd` | Estimated monthly cost at recommended target |
+| `monthly_delta_usd` | `target - current`. Negative = savings. |
+| `annual_delta_usd` | `monthly_delta * 12` |
+
+For orphans, `target_usd` is `0` and the delta represents savings if the
+volume is deleted.
+
+The default gp3 prices are AWS list prices for `us-east-1` as of late 2025:
+
+| Component | Default | Source |
+|-----------|---------|--------|
+| Storage | $0.08 / GiB-month | AWS list price |
+| IOPS over 3000 baseline | $0.005 / IOP-month | AWS list price |
+| Throughput over 125 baseline | $0.04 / MiB/s-month | AWS list price |
+
+Override defaults to match your customer's billing rate via CLI flags:
+
+```bash
+python ebs_rightsizer.py --region us-east-1 \
+    --price-storage 0.075 \
+    --price-iops 0.0045 \
+    --price-throughput 0.036
+```
+
+Or via JSON file:
+
+```json
+{
+  "storage_per_gib_month": 0.075,
+  "iops_per_iop_month_over_3000": 0.0045,
+  "throughput_per_mibps_month_over_125": 0.036
+}
+```
+
+```bash
+python ebs_rightsizer.py --region us-east-1 \
+    --pricing-file ./customer_prices.json
+```
+
+The summary line at the end of every run reports total monthly savings,
+total monthly added cost (for upsize recommendations), and the annualized
+net impact:
+
+```
+Estimated monthly impact: savings=$65.00, added=$0.00,
+net=$-65.00 (annualized $-780.00). Orphan deletion savings=$4.00/mo.
+```
+
+## CSV row order
+
+Rows are sorted by `attached_instances` so all volumes on the same EC2
+instance group together. Within an instance, rows are sorted by `volume_id`
+for deterministic output. Orphan (unattached) volumes appear at the bottom.
+
 ## Apply safety model
 
 - `--apply` alone is rejected. You must combine it with **either**
@@ -125,6 +192,10 @@ python ebs_rightsizer.py --region us-east-1 --days 40 --buffer 30
 | `--min-throughput` | 125 | Floor for throughput MiB/s (never goes below) |
 | `--max-workers` | 8 | Parallel CloudWatch threads |
 | `--output` | `ebs_rightsizing_report.csv` | Report path |
+| `--pricing-file` | none | JSON file with gp3 prices (see Pricing) |
+| `--price-storage` | 0.08 | Override $/GiB-month |
+| `--price-iops` | 0.005 | Override $/IOP-month above 3000 |
+| `--price-throughput` | 0.04 | Override $/MiB/s-month above 125 |
 | `--gp3-only` | **on** | Focus only on gp3 volumes |
 | `--all-types` | off | Override `--gp3-only` to include io1/io2/gp2 |
 | `--direction` | `both` | `both` / `upsize` / `downsize` filter for MODIFY rows |
@@ -208,13 +279,16 @@ For read-only operation, drop the `ApplyOnly` statement.
 ## Output sample
 
 ```
-volume_id,volume_type,size_gib,state,attached_instances,create_time,current_iops,current_throughput_mibps,peak_iops,peak_throughput_mibps,target_iops,target_throughput_mibps,direction,action,modification_state,co_finding_reasons,category,notes
-vol-0abc...,gp3,500,in-use,i-0123,2024-08-12T03:11:00+00:00,9000,500,1240.5,180.2,3000,250,DOWNSIZE,"MODIFY DOWNSIZE (Δ -6000 IOPS, -250 MiB/s)",DRY_RUN,VolumeIOPSOverProvisioned,rightsizing,datapoints=8640
-vol-0xyz...,gp3,75,in-use,i-0456,2026-05-14T02:48:00+00:00,3000,125,857.5,159.07,3000,200,UPSIZE,"MODIFY UPSIZE (Δ +0 IOPS, +75 MiB/s)",DRY_RUN,VolumeThroughputUnderProvisioned,rightsizing,datapoints=6548
+volume_id,volume_type,size_gib,state,attached_instances,create_time,current_iops,current_throughput_mibps,peak_iops,peak_throughput_mibps,target_iops,target_throughput_mibps,direction,action,monthly_cost_current_usd,monthly_cost_target_usd,monthly_delta_usd,annual_delta_usd,modification_state,co_finding_reasons,category,notes
+vol-bbbb...,gp3,200,in-use,i-aaaa,...,6000,250,50,10,3000,125,DOWNSIZE,"MODIFY DOWNSIZE (Δ -3000 IOPS, -125 MiB/s)",36.0,16.0,-20.0,-240.0,DRY_RUN,,rightsizing,datapoints=8640
+vol-cccc...,gp3,100,in-use,i-aaaa,...,3000,125,0,0,3000,125,NONE,NO_CHANGE - already matches target,8.0,8.0,0.0,0.0,,,rightsizing,datapoints=8640
+vol-aaaa...,gp3,500,in-use,i-bbbb,...,9000,500,50,10,3000,125,DOWNSIZE,"MODIFY DOWNSIZE (Δ -6000 IOPS, -375 MiB/s)",85.0,40.0,-45.0,-540.0,DRY_RUN,,rightsizing,datapoints=8640
+vol-dddd...,gp3,50,available,,...,3000,125,0,0,,,NONE,ORPHAN - unattached; consider snapshot+delete,4.0,0.0,-4.0,-48.0,,,orphan,age_days=400;encrypted;type=gp3
 ```
 
-The `direction` column makes it trivial to pivot the CSV in Excel: filter on
-`UPSIZE` for performance fixes, `DOWNSIZE` for cost savings.
+The `direction` column lets you filter UPSIZE / DOWNSIZE in Excel. The
+`monthly_delta_usd` column lets you sum savings across the report or sort
+by financial impact.
 
 ## Extending
 
