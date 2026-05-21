@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-EBS Right-Sizer
+EBS Cost Optimizer
 ===============
 Closes the loop between AWS Compute Optimizer EBS findings and actual
 CloudWatch usage history, then optionally applies new IOPS / throughput
@@ -48,7 +48,7 @@ from botocore.exceptions import BotoCoreError, ClientError
 # Constants
 # ---------------------------------------------------------------------------
 
-__version__ = "1.7.0"
+__version__ = "1.8.0"
 
 GP3_BASELINE_IOPS = 3000
 GP3_BASELINE_THROUGHPUT = 125  # MiB/s
@@ -88,7 +88,7 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(message)s",
     datefmt="%H:%M:%S",
 )
-log = logging.getLogger("ebs-rightsizer")
+log = logging.getLogger("ebs-cost-optimizer")
 
 
 # ---------------------------------------------------------------------------
@@ -130,7 +130,7 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         description=__doc__,
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    p.add_argument("--version", action="version", version=f"ebs-rightsizer {__version__}")
+    p.add_argument("--version", action="version", version=f"ebs-cost-optimizer {__version__}")
     p.add_argument("--region", required=True, help="AWS region, e.g. us-east-1")
     p.add_argument("--profile", default=None, help="AWS CLI profile (optional)")
     p.add_argument("--days", type=int, default=30,
@@ -308,7 +308,7 @@ def boto_config() -> Config:
         connect_timeout=10,
         read_timeout=60,
         max_pool_connections=20,
-        user_agent_extra=f"ebs-rightsizer/{__version__}",
+        user_agent_extra=f"ebs-cost-optimizer/{__version__}",
     )
 
 
@@ -1292,7 +1292,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     output_path = _apply_timestamp(args.output, enabled=args.timestamp)
 
     manifest = {
-        "tool": "ebs-rightsizer",
+        "tool": "ebs-cost-optimizer",
         "version": __version__,
         "generated_utc": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
         "account_id": account_id,

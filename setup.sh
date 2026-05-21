@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
 # ----------------------------------------------------------------------------
-# setup.sh — One-shot publish of EBS Right-Sizer to GitHub
+# setup.sh — One-shot publish of EBS Cost Optimizer to GitHub
 # ----------------------------------------------------------------------------
 # What this script does:
 #   1. Verifies you're inside the repo directory.
 #   2. Installs the GitHub CLI (gh) if it's missing.
 #   3. Authenticates gh via your browser (one-time).
-#   4. Creates a private repo at github.com/<user>/ebs-rightsizer.
+#   4. Creates a private repo at github.com/<user>/ebs-cost-optimizer.
 #   5. Pushes main + all tags.
 #
 # It is idempotent: rerunning after success only pushes new commits.
@@ -14,7 +14,7 @@
 
 set -euo pipefail
 
-REPO_NAME="${REPO_NAME:-ebs-rightsizer}"
+REPO_NAME="${REPO_NAME:-ebs-cost-optimizer}"
 REPO_DESC="${REPO_DESC:-Operationalize AWS Compute Optimizer EBS recommendations with real CloudWatch usage and dollar-denominated impact}"
 VISIBILITY="${VISIBILITY:-private}"   # set to public after review
 

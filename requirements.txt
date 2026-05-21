@@ -1,4 +1,4 @@
-# EBS Right-Sizer dependencies
+# EBS Cost Optimizer dependencies
 #
 # REQUIRED:
 #   boto3       AWS SDK for Python

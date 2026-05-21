@@ -1,6 +1,6 @@
 # Security Posture
 
-This document maps the EBS Right-Sizer's controls to the **AWS
+This document maps the EBS Cost Optimizer's controls to the **AWS
 Well-Architected Framework — Security Pillar** and standard secure-coding
 practice for AWS sample utilities.
 
@@ -121,7 +121,7 @@ process.
 2. **Scope the IAM policy to the regions you operate in** by adding a
    `Condition` block on `aws:RequestedRegion`.
 3. **Restrict `ec2:ModifyVolume` to specific tagged volumes** in
-   production (e.g., `aws:ResourceTag/managed-by: ebs-rightsizer`).
+   production (e.g., `aws:ResourceTag/managed-by: ebs-cost-optimizer`).
 4. **Pipe CSV reports into a controlled S3 bucket** with bucket
    encryption and explicit tagging if you need to persist them
    centrally — the script does not do this for you.

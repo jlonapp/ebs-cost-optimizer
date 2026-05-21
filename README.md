@@ -1,4 +1,4 @@
-# Amazon EBS Right-Sizer
+# Amazon EBS Cost Optimizer
 
 > **Operationalize AWS Compute Optimizer EBS recommendations with real
 > CloudWatch usage data, dollar-denominated impact, and safe automated
@@ -51,7 +51,7 @@ Identify gp3 volumes provisioned with IOPS or throughput well above their
 values during a controlled change window.
 
 ```bash
-python3 ebs_rightsizer.py --region us-east-1 --direction downsize
+python3 ebs_cost_optimizer.py --region us-east-1 --direction downsize
 ```
 
 The CSV gives you `monthly_delta_usd` per volume, a `SUBTOTAL` per EC2
@@ -59,7 +59,7 @@ instance, and a `GRAND_TOTAL` row at the bottom. Hand it to FinOps for
 sign-off, then:
 
 ```bash
-python3 ebs_rightsizer.py --region us-east-1 --direction downsize \
+python3 ebs_cost_optimizer.py --region us-east-1 --direction downsize \
     --volume-ids-file approved.txt --apply
 ```
 
@@ -70,7 +70,7 @@ throughput ceiling. The script flags these as `MODIFY UPSIZE` rows so app
 owners can react before users notice.
 
 ```bash
-python3 ebs_rightsizer.py --region us-east-1 --direction upsize
+python3 ebs_cost_optimizer.py --region us-east-1 --direction upsize
 ```
 
 ### Idle resource cleanup (orphans)
@@ -80,7 +80,7 @@ and the monthly cost they represent. The tool reports only — deletion stays
 a manual step, gated by your snapshot and change-management process.
 
 ```bash
-python3 ebs_rightsizer.py --region us-east-1 --orphans-only --output orphans.csv
+python3 ebs_cost_optimizer.py --region us-east-1 --orphans-only --output orphans.csv
 ```
 
 ### Multi-account governance
@@ -219,33 +219,33 @@ For read-only operation, omit the `ApplyOnly` statement.
 ## Quickstart
 
 ```bash
-git clone https://github.com/aws-samples/ebs-rightsizer.git
-cd ebs-rightsizer
+git clone https://github.com/aws-samples/ebs-cost-optimizer.git
+cd ebs-cost-optimizer
 pip install -r requirements.txt
 
 # Read-only report
-python3 ebs_rightsizer.py --region us-east-1 --include-orphans
+python3 ebs_cost_optimizer.py --region us-east-1 --include-orphans
 ```
 
 ## Common workflows
 
 ```bash
 # Cost-savings only (drop upsize recommendations)
-python3 ebs_rightsizer.py --region us-east-1 --direction downsize
+python3 ebs_cost_optimizer.py --region us-east-1 --direction downsize
 
 # Performance fixes only
-python3 ebs_rightsizer.py --region us-east-1 --direction upsize
+python3 ebs_cost_optimizer.py --region us-east-1 --direction upsize
 
 # Override default pricing with customer billing rates
-python3 ebs_rightsizer.py --region us-east-1 \
+python3 ebs_cost_optimizer.py --region us-east-1 \
     --price-storage 0.075 --price-iops 0.0045 --price-throughput 0.036
 
 # Apply to a vetted list (preferred apply path)
-python3 ebs_rightsizer.py --region us-east-1 \
+python3 ebs_cost_optimizer.py --region us-east-1 \
     --volume-ids-file approved.txt --apply
 
 # Apply to every flagged volume in scope (must opt in)
-python3 ebs_rightsizer.py --region us-east-1 --apply --apply-all
+python3 ebs_cost_optimizer.py --region us-east-1 --apply --apply-all
 ```
 
 ## CLI reference
@@ -288,7 +288,7 @@ Every report (CSV and XLSX) carries a manifest banner at the top with full
 run provenance:
 
 ```
-Generated 2026-05-21T18:23:00Z by ebs-rightsizer v1.7.0 |
+Generated 2026-05-21T18:23:00Z by ebs-cost-optimizer v1.8.0 |
 Account 711457211352 | Region us-east-1
 Parameters: lookback=30d, buffer=20.0%, floors=3000 IOPS / 125 MiB/s,
 gp3-only=True, direction=both, applied=False
@@ -317,13 +317,13 @@ The format is human-readable, lexically sortable, and Windows-safe (no `:`).
 
 For explicit positioning, use the `{ts}` placeholder:
 ```bash
-python3 ebs_rightsizer.py --region us-east-1 --output snapshot_{ts}.xlsx
+python3 ebs_cost_optimizer.py --region us-east-1 --output snapshot_{ts}.xlsx
 # -> snapshot_2026-05-21_18-23-00Z.xlsx
 ```
 
 To disable timestamping (overwrite same filename each run):
 ```bash
-python3 ebs_rightsizer.py --region us-east-1 --no-timestamp \
+python3 ebs_cost_optimizer.py --region us-east-1 --no-timestamp \
     --output EBS_Cost_Optimization.csv
 ```
 
@@ -332,7 +332,7 @@ python3 ebs_rightsizer.py --region us-east-1 --no-timestamp \
 Plain text, suitable for downstream tooling, scripting, and version control.
 
 ```bash
-python3 ebs_rightsizer.py --region us-east-1 \
+python3 ebs_cost_optimizer.py --region us-east-1 \
     --output EBS_Cost_Optimization.csv
 ```
 
@@ -344,7 +344,7 @@ USD currency formatting (negative values in red), color-coded direction
 visually distinct SUBTOTAL (pale blue) and GRAND_TOTAL (navy) rows.
 
 ```bash
-python3 ebs_rightsizer.py --region us-east-1
+python3 ebs_cost_optimizer.py --region us-east-1
 # -> EBS_Cost_Optimization_2026-05-21_18-23-00Z.xlsx
 ```
 
