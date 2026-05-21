@@ -141,7 +141,12 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     p.add_argument("--max-workers", type=int, default=DEFAULT_MAX_WORKERS,
                    help=f"Parallel CloudWatch workers (default {DEFAULT_MAX_WORKERS})")
     p.add_argument("--output", default="ebs_rightsizing_report.csv",
-                   help="CSV report output path")
+                   help="Report path. Use .xlsx extension for styled Excel output. "
+                        "By default a UTC timestamp is inserted before the extension "
+                        "(e.g. report.xlsx -> report_20260521T182300Z.xlsx). "
+                        "Use {ts} as a placeholder for explicit positioning.")
+    p.add_argument("--no-timestamp", dest="timestamp", action="store_false", default=True,
+                   help="Disable automatic timestamp insertion in the output filename")
     p.add_argument("--no-subtotals", dest="subtotals", action="store_false", default=True,
                    help="Disable per-instance subtotal rows (default ON)")
 
@@ -1139,7 +1144,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     sorted_rows = _sort_rows(rows)
     final_rows = _insert_subtotals(sorted_rows) if args.subtotals else sorted_rows
-    write_report(final_rows, args.output)
+    output_path = _apply_timestamp(args.output, enabled=args.timestamp)
+    write_report(final_rows, output_path)
 
     # Summary
     counts = {"MODIFY": 0, "NO_CHANGE": 0, "SKIP": 0, "ORPHAN": 0}
@@ -1173,6 +1179,28 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     failed = sum(1 for r in rows if r.modification_state == "FAILED")
     return 1 if failed else 0
+
+
+def _apply_timestamp(path: str, enabled: bool) -> str:
+    """Insert a UTC timestamp into the output filename.
+
+    Behavior:
+      - If --no-timestamp was passed (enabled=False) the path is returned
+        unchanged.
+      - If the path contains the literal `{ts}` placeholder it is replaced
+        verbatim (path may already include or omit an extension).
+      - Otherwise the timestamp is inserted before the file extension:
+            report.xlsx -> report_20260521T182300Z.xlsx
+            reports/q2.csv -> reports/q2_20260521T182300Z.csv
+            myfile  -> myfile_20260521T182300Z   (no extension preserved)
+    """
+    if not enabled:
+        return path
+    ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    if "{ts}" in path:
+        return path.replace("{ts}", ts)
+    base, ext = os.path.splitext(path)
+    return f"{base}_{ts}{ext}" if ext else f"{base}_{ts}"
 
 
 def _sort_rows(rows: List[VolumeReport]) -> List[VolumeReport]:

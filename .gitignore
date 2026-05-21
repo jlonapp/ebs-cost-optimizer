@@ -1,6 +1,8 @@
 # Generated report output
 ebs_rightsizing_report.csv
 *.csv
+*.xlsx
+!sample_report.xlsx
 
 # Approved volume lists may carry sensitive identifiers
 approved_volumes.txt

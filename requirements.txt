@@ -1,17 +1,31 @@
 # EBS Right-Sizer dependencies
 #
-# Required:
-#   boto3 — AWS SDK
+# REQUIRED:
+#   boto3       AWS SDK for Python
 #
-# Optional:
-#   openpyxl — only required if you want styled .xlsx output
-#              (auto-detected when --output ends in .xlsx)
+# OPTIONAL:
+#   openpyxl    Only needed if you generate styled .xlsx reports
+#               (auto-detected from --output extension)
 #
-# Amazon Linux package manager install (recommended on EC2):
-#   AL2023:  sudo dnf install -y python3-boto3 python3-openpyxl
-#   AL2:     sudo yum install -y python3-boto3 python3-openpyxl
+# ============================================================================
+# Install on Amazon Linux 2023 (recommended on EC2):
+#   sudo dnf install -y python3-boto3 python3-openpyxl
 #
-# pip install:
+# Install on Amazon Linux 2:
+#   sudo yum install -y python3-boto3 python3-openpyxl
+#
+# Install on Debian / Ubuntu:
+#   sudo apt-get install -y python3-boto3 python3-openpyxl
+#
+# Install on RHEL / CentOS / Rocky:
+#   sudo yum install -y python3-boto3 python3-openpyxl
+#
+# Install via pip (macOS, generic Linux, virtualenvs):
 #   pip3 install -r requirements.txt
+#
+# If pip3 is missing on Amazon Linux:
+#   sudo dnf install -y python3-pip   # AL2023
+#   sudo yum install -y python3-pip   # AL2
+# ============================================================================
 boto3>=1.26.0
 openpyxl>=3.0.0

@@ -141,12 +141,51 @@ independently tunable for cost optimization. Use `--all-types` to widen.
 
 ## Prerequisites
 
-- Python 3.8+
-- `boto3` 1.26+ (`pip install -r requirements.txt`, or
-  `sudo dnf install python3-boto3` on Amazon Linux 2023)
-- AWS credentials with the IAM permissions listed below
-- AWS Compute Optimizer **opted in** for the target account
+- **Python** 3.8 or later
+- **boto3** 1.26+ (AWS SDK)
+- **openpyxl** 3.0+ — required only when generating `.xlsx` reports
+- **AWS credentials** with the IAM permissions listed below
+- **AWS Compute Optimizer opted in** for the target account
   ([documentation](https://docs.aws.amazon.com/compute-optimizer/latest/ug/getting-started.html))
+
+### Install the dependencies
+
+Pick whichever fits your environment.
+
+**Amazon Linux 2023** (common on EC2):
+```bash
+sudo dnf install -y python3-boto3 python3-openpyxl
+```
+
+**Amazon Linux 2:**
+```bash
+sudo yum install -y python3-boto3 python3-openpyxl
+```
+
+**Debian / Ubuntu:**
+```bash
+sudo apt-get install -y python3-boto3 python3-openpyxl
+```
+
+**RHEL / CentOS / Rocky:**
+```bash
+sudo yum install -y python3-boto3 python3-openpyxl
+```
+
+**macOS / generic Linux with pip:**
+```bash
+pip3 install --user -r requirements.txt
+```
+
+If `pip3` itself is missing on Amazon Linux:
+```bash
+sudo dnf install -y python3-pip   # AL2023
+sudo yum install -y python3-pip   # AL2
+```
+
+`openpyxl` is optional. Skip it if you only want CSV output. The script
+will detect it's missing and emit a platform-specific install hint if you
+ask for `.xlsx` without it installed.
 
 ### Required IAM permissions
 
@@ -220,7 +259,8 @@ python3 ebs_rightsizer.py --region us-east-1 --apply --apply-all
 | `--min-iops` | 3000 | Floor for IOPS (gp3 baseline) |
 | `--min-throughput` | 125 | Floor for throughput MiB/s |
 | `--max-workers` | 8 | Parallel CloudWatch threads |
-| `--output` | `ebs_rightsizing_report.csv` | Report path |
+| `--output` | `ebs_rightsizing_report.csv` | Report path. Use `.xlsx` for styled Excel |
+| `--no-timestamp` | off (timestamps on) | Disable UTC timestamp suffix in filename |
 | `--no-subtotals` | off (subtotals on) | Disable per-instance subtotal rows |
 | `--pricing-file` | none | JSON file with gp3 prices |
 | `--price-storage` | 0.08 | Override $/GiB-month |
@@ -242,6 +282,29 @@ python3 ebs_rightsizer.py --region us-east-1 --apply --apply-all
 The script produces either a CSV (default) or a styled Excel workbook
 based on the file extension passed to `--output`.
 
+### Output filename and timestamps
+
+Every report filename is automatically suffixed with a UTC timestamp so
+runs never overwrite each other and chronological sorting works
+correctly:
+
+```
+report.xlsx              ->  report_20260521T182300Z.xlsx
+ebs_rightsizing_report.csv -> ebs_rightsizing_report_20260521T182300Z.csv
+reports/q2-audit.csv     ->  reports/q2-audit_20260521T182300Z.csv
+```
+
+For explicit positioning, use the `{ts}` placeholder:
+```bash
+python3 ebs_rightsizer.py --region us-east-1 --output snapshot_{ts}.xlsx
+# -> snapshot_20260521T182300Z.xlsx
+```
+
+To disable timestamping (overwrite same filename each run):
+```bash
+python3 ebs_rightsizer.py --region us-east-1 --no-timestamp --output report.csv
+```
+
 ### CSV (default)
 
 Plain text, suitable for downstream tooling, scripting, and version control.
@@ -261,7 +324,7 @@ visually distinct SUBTOTAL (pale blue) and GRAND_TOTAL (navy) rows.
 python3 ebs_rightsizer.py --region us-east-1 --output report.xlsx
 ```
 
-Requires `openpyxl` (already in `requirements.txt`).
+Requires `openpyxl` (see Prerequisites above for install commands).
 
 ## Output schema
 
