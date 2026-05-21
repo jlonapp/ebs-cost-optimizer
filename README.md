@@ -1,248 +1,154 @@
-# EBS Right-Sizer
+# Amazon EBS Right-Sizer
 
-Closes the loop between **AWS Compute Optimizer** EBS findings and actual
-**CloudWatch** usage history, then optionally applies new IOPS / throughput
-values via `ec2:ModifyVolume`. Also reports orphan (unattached) volumes that
-typically dominate idle-resource spend.
+> **Operationalize AWS Compute Optimizer EBS recommendations with real
+> CloudWatch usage data, dollar-denominated impact, and safe automated
+> remediation.**
 
-## What it does
+[![License: Apache 2.0](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](LICENSE)
+[![Python 3.8+](https://img.shields.io/badge/python-3.8+-blue.svg)](https://www.python.org/downloads/)
 
-1. Pulls Compute Optimizer `GetEBSVolumeRecommendations` for every volume
-   flagged `NotOptimized`.
-2. Queries CloudWatch `AWS/EBS` metrics
-   (`VolumeReadOps`, `VolumeWriteOps`, `VolumeReadBytes`, `VolumeWriteBytes`)
-   over the last N days at native 5-minute resolution.
-3. Computes peak IOPS and peak throughput (MiB/s).
-4. Compares against current `Iops` / `Throughput` from `DescribeVolumes`.
-5. Calculates target = `peak * (1 + buffer%)`, floored at gp3 baseline,
-   capped at the volume type's service limit.
-6. Estimates monthly and annual cost impact for each row using a
-   configurable gp3 pricing model.
-7. Optionally lists orphan volumes (state `available`) with monthly cost as
-   the savings if deleted.
-8. Sorts the report by attached EC2 instance so volumes on the same host
-   group together; orphans appear last.
-9. Writes a CSV report. With `--apply` plus an explicit scope, calls
-   `ec2:ModifyVolume`.
+## Overview
 
-## Volume types
+AWS Compute Optimizer surfaces over- and under-provisioned EBS volumes, but
+acting on those findings at scale is a manual, per-volume process today.
+This utility closes that loop end-to-end:
 
-By default, the script focuses on **gp3 only** since that's where IOPS and
-throughput are independently tunable for cost optimization. Use `--all-types`
-to widen the scan.
+1. Pulls every Compute Optimizer EBS recommendation flagged `NotOptimized`.
+2. Validates each recommendation against **30 days of actual workload data**
+   from CloudWatch (peak IOPS and throughput).
+3. Calculates a right-sized target with a configurable safety buffer,
+   floored at the gp3 baseline (3000 IOPS / 125 MiB/s) and capped at the
+   volume type's service ceiling.
+4. Estimates **monthly and annual cost impact in USD** using a configurable
+   pricing model (defaults to AWS list prices).
+5. Produces a CSV report sorted by attached EC2 instance with per-instance
+   subtotals, an orphan-volume section, and a grand total.
+6. With explicit opt-in, applies the changes via `ec2:ModifyVolume` (online,
+   no detach, no I/O pause).
+
+## Why this is helpful
+
+Compute Optimizer dashboards routinely show tens of thousands of dollars in
+flagged EBS savings, but customers struggle to act on them because:
+
+- **Recommendations are heuristic.** Customers want to verify against real
+  workload peaks before reducing provisioned IOPS or throughput.
+- **Per-volume console actions don't scale.** Modifying 300 volumes
+  manually is a multi-day exercise prone to errors.
+- **Financial impact isn't visible.** The dashboard shows aggregate dollars
+  but not per-volume or per-instance numbers stakeholders can act on.
+- **Orphan volumes are an adjacent problem.** Unattached `available`
+  volumes are pure waste and rarely get cleaned up.
+
+This tool addresses all four in a single, auditable run.
+
+## Use cases
+
+### Cost optimization (downsize)
+
+Identify gp3 volumes provisioned with IOPS or throughput well above their
+30-day peak, generate a per-volume savings estimate, and apply right-sized
+values during a controlled change window.
+
+```bash
+python3 ebs_rightsizer.py --region us-east-1 --direction downsize
+```
+
+The CSV gives you `monthly_delta_usd` per volume, a `SUBTOTAL` per EC2
+instance, and a `GRAND_TOTAL` row at the bottom. Hand it to FinOps for
+sign-off, then:
+
+```bash
+python3 ebs_rightsizer.py --region us-east-1 --direction downsize \
+    --volume-ids-file approved.txt --apply
+```
+
+### Performance remediation (upsize)
+
+Surface volumes whose workload is being throttled by a low IOPS or
+throughput ceiling. The script flags these as `MODIFY UPSIZE` rows so app
+owners can react before users notice.
+
+```bash
+python3 ebs_rightsizer.py --region us-east-1 --direction upsize
+```
+
+### Idle resource cleanup (orphans)
+
+Inventory unattached `available` volumes with their age, encryption status,
+and the monthly cost they represent. The tool reports only — deletion stays
+a manual step, gated by your snapshot and change-management process.
+
+```bash
+python3 ebs_rightsizer.py --region us-east-1 --orphans-only --output orphans.csv
+```
+
+### Multi-account governance
+
+Wrap the script in an STS `AssumeRole` loop across organization member
+accounts to produce a consolidated report from the management account or a
+delegated admin. The script is per-account by design so the apply path stays
+auditable per account boundary.
+
+## How it works
+
+### Data flow
+
+```
+┌────────────────────────┐
+│ AWS Compute Optimizer  │  GetEBSVolumeRecommendations (paginated)
+└──────────┬─────────────┘
+           │  NotOptimized findings
+           ▼
+┌────────────────────────┐
+│ Amazon CloudWatch      │  GetMetricData (single call per volume,
+└──────────┬─────────────┘    all 4 EBS metrics, 5-minute resolution)
+           │  peak IOPS + throughput
+           ▼
+┌────────────────────────┐
+│ Amazon EC2             │  DescribeVolumes, DescribeVolumesModifications
+└──────────┬─────────────┘
+           │  current Iops/Throughput, cooldown state
+           ▼
+┌────────────────────────┐
+│ Right-sizing engine    │  target = max(floor, peak × (1 + buffer))
+│ Cost engine            │           capped at type service limit
+└──────────┬─────────────┘
+           │
+           ▼
+┌────────────────────────┐
+│ CSV report             │  sorted by attached_instances,
+└──────────┬─────────────┘    subtotals + grand total
+           │
+           ▼  (with --apply)
+┌────────────────────────┐
+│ ec2:ModifyVolume       │  online change, no detach
+└────────────────────────┘
+```
+
+### Volume types
+
+By default, the script focuses on **gp3** since IOPS and throughput are
+independently tunable for cost optimization. Use `--all-types` to widen.
 
 | Type    | IOPS tunable     | Throughput tunable | Default behavior |
 |---------|------------------|---------------------|------------------|
 | gp3     | yes              | yes                 | full right-size  |
-| io1     | yes              | no                  | filtered out (use `--all-types`) |
-| io2     | yes              | no                  | filtered out (use `--all-types`) |
-| gp2     | no (size-bound)  | no                  | filtered out (use `--all-types`) |
-| st1/sc1 | no               | no                  | filtered out (use `--all-types`) |
+| io1     | yes              | no                  | filtered out     |
+| io2     | yes              | no                  | filtered out     |
+| gp2     | no (size-bound)  | no                  | filtered out     |
+| st1/sc1 | no               | no                  | filtered out     |
 
-## Install
+## Prerequisites
 
-```bash
-pip install -r requirements.txt
-```
+- Python 3.8+
+- `boto3` 1.26+ (`pip install -r requirements.txt`, or
+  `sudo dnf install python3-boto3` on Amazon Linux 2023)
+- AWS credentials with the IAM permissions listed below
+- AWS Compute Optimizer **opted in** for the target account
+  ([documentation](https://docs.aws.amazon.com/compute-optimizer/latest/ug/getting-started.html))
 
-## Common workflows
-
-Read-only report (gp3 only, both directions):
-
-```bash
-python ebs_rightsizer.py --region us-east-1
-```
-
-Cost-savings only (drop upsize recommendations):
-
-```bash
-python ebs_rightsizer.py --region us-east-1 --direction downsize
-```
-
-Performance fixes only (drop downsize recommendations):
-
-```bash
-python ebs_rightsizer.py --region us-east-1 --direction upsize
-```
-
-Include orphan volumes in the same report:
-
-```bash
-python ebs_rightsizer.py --region us-east-1 --include-orphans
-```
-
-Orphan-only report:
-
-```bash
-python ebs_rightsizer.py --region us-east-1 --orphans-only \
-    --output orphans.csv
-```
-
-Widen scan to io1 / io2 / gp2:
-
-```bash
-python ebs_rightsizer.py --region us-east-1 --all-types
-```
-
-Apply downsize-only to a vetted list (preferred apply path):
-
-```bash
-python ebs_rightsizer.py --region us-east-1 \
-    --direction downsize \
-    --volume-ids-file ./approved_volumes.txt \
-    --apply
-```
-
-`approved_volumes.txt` is one volume ID per line; `#` lines are comments.
-
-Apply to every Compute-Optimizer-flagged volume (must opt in explicitly):
-
-```bash
-python ebs_rightsizer.py --region us-east-1 --apply --apply-all
-```
-
-Tune lookback and buffer:
-
-```bash
-python ebs_rightsizer.py --region us-east-1 --days 40 --buffer 30
-```
-
-## Pricing model
-
-Each row carries four cost columns so the financial impact is visible per
-volume and at the run-level summary:
-
-| Column | Meaning |
-|--------|---------|
-| `monthly_cost_current_usd` | Estimated monthly cost at current provisioning |
-| `monthly_cost_target_usd` | Estimated monthly cost at recommended target |
-| `monthly_delta_usd` | `target - current`. Negative = savings. |
-| `annual_delta_usd` | `monthly_delta * 12` |
-
-For orphans, `target_usd` is `0` and the delta represents savings if the
-volume is deleted.
-
-The default gp3 prices are AWS list prices for `us-east-1` as of late 2025:
-
-| Component | Default | Source |
-|-----------|---------|--------|
-| Storage | $0.08 / GiB-month | AWS list price |
-| IOPS over 3000 baseline | $0.005 / IOP-month | AWS list price |
-| Throughput over 125 baseline | $0.04 / MiB/s-month | AWS list price |
-
-Override defaults to match your customer's billing rate via CLI flags:
-
-```bash
-python ebs_rightsizer.py --region us-east-1 \
-    --price-storage 0.075 \
-    --price-iops 0.0045 \
-    --price-throughput 0.036
-```
-
-Or via JSON file:
-
-```json
-{
-  "storage_per_gib_month": 0.075,
-  "iops_per_iop_month_over_3000": 0.0045,
-  "throughput_per_mibps_month_over_125": 0.036
-}
-```
-
-```bash
-python ebs_rightsizer.py --region us-east-1 \
-    --pricing-file ./customer_prices.json
-```
-
-The summary line at the end of every run reports total monthly savings,
-total monthly added cost (for upsize recommendations), and the annualized
-net impact:
-
-```
-Estimated monthly impact: savings=$65.00, added=$0.00,
-net=$-65.00 (annualized $-780.00). Orphan deletion savings=$4.00/mo.
-```
-
-## CSV row order
-
-Rows are sorted by `attached_instances` so all volumes on the same EC2
-instance group together. Within an instance, rows are sorted by `volume_id`
-for deterministic output. Orphan (unattached) volumes appear at the bottom.
-
-### Per-instance subtotals (default ON)
-
-After each instance's volume group, a `SUBTOTAL` row rolls up:
-
-- `monthly_cost_current_usd` (sum)
-- `monthly_cost_target_usd` (sum)
-- `monthly_delta_usd` (sum, negative = savings)
-- `annual_delta_usd` (sum × 12)
-
-Orphan volumes get a single combined `ORPHAN_SUBTOTAL` row, and a final
-`GRAND_TOTAL` row sums the entire report. The `volume_id` column carries
-the literal string `SUBTOTAL`, `ORPHAN_SUBTOTAL`, or `GRAND_TOTAL` so they
-are trivial to filter or pivot in Excel.
-
-To disable totals (e.g., for downstream tooling that only wants leaf rows):
-
-```bash
-python ebs_rightsizer.py --region us-east-1 --no-subtotals
-```
-
-Sample with subtotals:
-
-```
-volume_id,...,attached_instances,...,monthly_delta_usd,annual_delta_usd,...
-vol-bbbb...,...,i-aaaa,...,-15.00,-180.00,...
-vol-cccc...,...,i-aaaa,...,0.00,0.00,...
-SUBTOTAL,...,i-aaaa,...,-15.00,-180.00,...
-vol-aaaa...,...,i-bbbb,...,-50.00,-600.00,...
-SUBTOTAL,...,i-bbbb,...,-50.00,-600.00,...
-vol-dddd...,...,,...,-4.00,-48.00,...
-ORPHAN_SUBTOTAL,...,(orphan),...,-4.00,-48.00,...
-GRAND_TOTAL,...,,...,-69.00,-828.00,...
-```
-
-## Apply safety model
-
-- `--apply` alone is rejected. You must combine it with **either**
-  `--volume-ids` / `--volume-ids-file` (a specific scope) **or** `--apply-all`
-  (explicit opt-in to act on every flagged volume).
-- Interactive confirmation is required unless `--yes` is passed.
-- In non-interactive sessions `--yes` is mandatory.
-- Dry-run is the default in every other case.
-- The script checks `DescribeVolumesModifications` and skips volumes that are
-  already mid-modification (avoids the 6-hour cooldown error).
-
-## CLI reference
-
-| Flag | Default | Purpose |
-|------|---------|---------|
-| `--region` | required | AWS region |
-| `--profile` | none | AWS CLI profile |
-| `--days` | 30 | CloudWatch lookback (1-63) |
-| `--buffer` | 20 | Headroom percentage above peak |
-| `--min-iops` | 3000 | Floor for IOPS (gp3 baseline; never goes below) |
-| `--min-throughput` | 125 | Floor for throughput MiB/s (never goes below) |
-| `--max-workers` | 8 | Parallel CloudWatch threads |
-| `--output` | `ebs_rightsizing_report.csv` | Report path |
-| `--no-subtotals` | off (subtotals on) | Disable per-instance subtotal rows |
-| `--pricing-file` | none | JSON file with gp3 prices (see Pricing) |
-| `--price-storage` | 0.08 | Override $/GiB-month |
-| `--price-iops` | 0.005 | Override $/IOP-month above 3000 |
-| `--price-throughput` | 0.04 | Override $/MiB/s-month above 125 |
-| `--gp3-only` | **on** | Focus only on gp3 volumes |
-| `--all-types` | off | Override `--gp3-only` to include io1/io2/gp2 |
-| `--direction` | `both` | `both` / `upsize` / `downsize` filter for MODIFY rows |
-| `--include-orphans` | off | Append unattached volumes to report |
-| `--orphans-only` | off | Skip CO findings, just list orphans |
-| `--volume-ids` | none | Limit scope to these IDs |
-| `--volume-ids-file` | none | Same, but read from file |
-| `--apply` | off | Call `ec2:ModifyVolume` on in-scope MODIFY rows |
-| `--apply-all` | off | Required for `--apply` without an ID list |
-| `--yes` | off | Skip interactive confirm prompt |
-
-## Required IAM
+### Required IAM permissions
 
 ```json
 {
@@ -269,67 +175,140 @@ GRAND_TOTAL,...,,...,-69.00,-828.00,...
 }
 ```
 
-For read-only operation, drop the `ApplyOnly` statement.
+For read-only operation, omit the `ApplyOnly` statement.
 
-## Operational notes
+## Quickstart
 
-- **Compute Optimizer must be opted in.** Enable in the account (or org via
-  the management account); allow ~24h after opt-in for findings to populate.
-- **EBS metric resolution is 5 minutes** unless detailed monitoring is on.
-  The script uses `Period=300` and converts `Sum` to a per-second rate, which
-  matches how Compute Optimizer normalizes peak utilization.
-- **CloudWatch retention.** 5-minute datapoints are kept for 63 days. The
-  script enforces `--days <= 63`.
-- **ModifyVolume cooldown.** AWS only allows another modification on the same
-  volume every 6 hours. The script proactively skips volumes whose previous
-  modification is still `modifying` or `optimizing`.
-- **Throughput parameter is gp3-only.** For io1/io2 the script only adjusts
-  IOPS.
-- **gp2 volumes** are reported but skipped for modification because IOPS on
-  gp2 is bound to volume size. Migrate to gp3 first.
-- **Orphan volumes.** The script flags them with age and encryption status.
-  Deletion is not automated. Snapshot first, then delete via your normal
-  change process.
+```bash
+git clone https://github.com/aws-samples/ebs-rightsizer.git
+cd ebs-rightsizer
+pip install -r requirements.txt
 
-## Security and best-practice posture
-
-- **Read-only by default.** Apply requires both `--apply` and an explicit
-  scope flag.
-- **Interactive confirmation** before any `ModifyVolume` call.
-- **Adaptive retries** via `botocore.config.Config(retries='adaptive')` to
-  handle Compute Optimizer and CloudWatch throttling cleanly.
-- **CSV injection guard.** Cells starting with `=`, `+`, `-`, `@`, `\t`, `\r`
-  are prefixed with `'` so spreadsheet apps don't execute formulas.
-- **Atomic file writes** (write to `.tmp`, then `os.replace`) so a crash
-  mid-run doesn't leave a corrupt CSV.
-- **Strict input validation** for region, volume IDs, lookback bounds, and
-  numeric ranges.
-- **No secrets in logs.** Only volume IDs, sizes, and metric values are
-  emitted.
-- **Bounded parallelism** (`--max-workers`, default 8) to stay well under
-  CloudWatch account RPS limits.
-- **Least-privilege IAM** sample provided above.
-- **No outbound network calls** other than AWS APIs.
-
-## Output sample
-
-```
-volume_id,volume_type,size_gib,state,attached_instances,create_time,current_iops,current_throughput_mibps,peak_iops,peak_throughput_mibps,target_iops,target_throughput_mibps,direction,action,monthly_cost_current_usd,monthly_cost_target_usd,monthly_delta_usd,annual_delta_usd,modification_state,co_finding_reasons,category,notes
-vol-bbbb...,gp3,200,in-use,i-aaaa,...,6000,250,50,10,3000,125,DOWNSIZE,"MODIFY DOWNSIZE (Δ -3000 IOPS, -125 MiB/s)",36.0,16.0,-20.0,-240.0,DRY_RUN,,rightsizing,datapoints=8640
-vol-cccc...,gp3,100,in-use,i-aaaa,...,3000,125,0,0,3000,125,NONE,NO_CHANGE - already matches target,8.0,8.0,0.0,0.0,,,rightsizing,datapoints=8640
-vol-aaaa...,gp3,500,in-use,i-bbbb,...,9000,500,50,10,3000,125,DOWNSIZE,"MODIFY DOWNSIZE (Δ -6000 IOPS, -375 MiB/s)",85.0,40.0,-45.0,-540.0,DRY_RUN,,rightsizing,datapoints=8640
-vol-dddd...,gp3,50,available,,...,3000,125,0,0,,,NONE,ORPHAN - unattached; consider snapshot+delete,4.0,0.0,-4.0,-48.0,,,orphan,age_days=400;encrypted;type=gp3
+# Read-only report
+python3 ebs_rightsizer.py --region us-east-1 --include-orphans
 ```
 
-The `direction` column lets you filter UPSIZE / DOWNSIZE in Excel. The
-`monthly_delta_usd` column lets you sum savings across the report or sort
-by financial impact.
+## Common workflows
 
-## Extending
+```bash
+# Cost-savings only (drop upsize recommendations)
+python3 ebs_rightsizer.py --region us-east-1 --direction downsize
 
-- **Multi-account / org-wide:** wrap the boto3 session in an STS `AssumeRole`
-  loop over all accounts in the org and aggregate the CSVs.
-- **Slack / SNS notifications:** hook after each `MODIFY` log line.
-- **Lambda + EventBridge:** schedule weekly to keep volumes right-sized as
-  workloads evolve.
-- **Tag-based exclusions:** filter `findings` by a `do-not-modify` tag.
+# Performance fixes only
+python3 ebs_rightsizer.py --region us-east-1 --direction upsize
+
+# Override default pricing with customer billing rates
+python3 ebs_rightsizer.py --region us-east-1 \
+    --price-storage 0.075 --price-iops 0.0045 --price-throughput 0.036
+
+# Apply to a vetted list (preferred apply path)
+python3 ebs_rightsizer.py --region us-east-1 \
+    --volume-ids-file approved.txt --apply
+
+# Apply to every flagged volume in scope (must opt in)
+python3 ebs_rightsizer.py --region us-east-1 --apply --apply-all
+```
+
+## CLI reference
+
+| Flag | Default | Purpose |
+|------|---------|---------|
+| `--region` | required | AWS region |
+| `--profile` | none | AWS CLI profile |
+| `--days` | 30 | CloudWatch lookback (1-63) |
+| `--buffer` | 20 | Headroom percentage above peak |
+| `--min-iops` | 3000 | Floor for IOPS (gp3 baseline) |
+| `--min-throughput` | 125 | Floor for throughput MiB/s |
+| `--max-workers` | 8 | Parallel CloudWatch threads |
+| `--output` | `ebs_rightsizing_report.csv` | Report path |
+| `--no-subtotals` | off (subtotals on) | Disable per-instance subtotal rows |
+| `--pricing-file` | none | JSON file with gp3 prices |
+| `--price-storage` | 0.08 | Override $/GiB-month |
+| `--price-iops` | 0.005 | Override $/IOP-month above 3000 |
+| `--price-throughput` | 0.04 | Override $/MiB/s-month above 125 |
+| `--gp3-only` | **on** | Focus only on gp3 volumes |
+| `--all-types` | off | Include io1/io2/gp2 |
+| `--direction` | `both` | `both` / `upsize` / `downsize` |
+| `--include-orphans` | off | Append unattached volumes |
+| `--orphans-only` | off | Skip CO findings, just list orphans |
+| `--volume-ids` | none | Limit scope to these IDs |
+| `--volume-ids-file` | none | Same, read from file |
+| `--apply` | off | Call `ec2:ModifyVolume` |
+| `--apply-all` | off | Required for `--apply` without an ID list |
+| `--yes` | off | Skip interactive confirm prompt |
+
+## Output schema
+
+| Column | Description |
+|--------|-------------|
+| `volume_id` | EBS volume ID, or `SUBTOTAL` / `ORPHAN_SUBTOTAL` / `GRAND_TOTAL` |
+| `volume_type` | `gp3`, `io1`, etc. |
+| `size_gib` | Volume size |
+| `state` | `in-use`, `available`, etc. |
+| `attached_instances` | Comma-separated EC2 instance IDs |
+| `create_time` | ISO 8601 |
+| `current_iops` / `current_throughput_mibps` | Current provisioning |
+| `peak_iops` / `peak_throughput_mibps` | Observed peak over `--days` window |
+| `target_iops` / `target_throughput_mibps` | Recommended target |
+| `direction` | `UPSIZE`, `DOWNSIZE`, or `NONE` |
+| `action` | Human-readable summary |
+| `monthly_cost_current_usd` | Estimated monthly cost at current settings |
+| `monthly_cost_target_usd` | Estimated monthly cost at target |
+| `monthly_delta_usd` | `target − current`. Negative = savings |
+| `annual_delta_usd` | `monthly_delta × 12` |
+| `modification_state` | Result of `ModifyVolume` (or `DRY_RUN`) |
+| `co_finding_reasons` | Compute Optimizer reason codes |
+| `category` | `rightsizing`, `orphan`, `subtotal`, or `total` |
+| `notes` | Datapoint count, orphan age, encryption status |
+
+## Safety controls
+
+- **Read-only by default.** `--apply` requires either `--volume-ids` /
+  `--volume-ids-file` or explicit `--apply-all`.
+- **Interactive confirmation** before any modification. Non-interactive
+  sessions require `--yes`.
+- **Cooldown awareness.** Skips volumes already mid-modification (the AWS
+  6-hour cooldown).
+- **Adaptive retries** for Compute Optimizer and CloudWatch throttling.
+- **CSV injection guard** for spreadsheet safety.
+- **Atomic file writes** so a crash never produces a half-written CSV.
+- **Strict input validation** for region, volume IDs, and numeric ranges.
+- **Bounded parallelism** to stay under CloudWatch account RPS limits.
+
+## Limitations
+
+- AWS Compute Optimizer takes ~24h after opt-in to populate findings, and
+  ~14d to populate `findingReasonCodes` for new volumes.
+- CloudWatch retains 5-minute datapoints for **63 days**; lookback is
+  capped at 63.
+- The pricing model covers gp3 only. For io1/io2/gp2/st1/sc1, the cost
+  columns remain at 0; widen the model in `DEFAULT_PRICING_*` if needed.
+- AWS only allows one `ModifyVolume` per volume every 6 hours. Re-runs
+  within that window will skip cooldown-bound volumes.
+- Per-account by design. Multi-account scans require an STS `AssumeRole`
+  wrapper.
+
+## Roadmap
+
+- Multi-account / Organizations-wide aggregator with `AssumeRole` loop.
+- Tag-based exclusion (`do-not-modify=true`).
+- AWS Lambda packaging with EventBridge schedule and SNS notifications.
+- Slack / Microsoft Teams notifier hook.
+- Optional Cost Explorer integration to pull actual blended rates per
+  account.
+
+## Security
+
+See [CONTRIBUTING.md#security-issue-notifications](CONTRIBUTING.md) for
+information about reporting vulnerabilities.
+
+## License
+
+This project is licensed under the Apache-2.0 License. See [LICENSE](LICENSE).
+
+## Disclaimer
+
+This is sample code intended to demonstrate AWS service capabilities. Test
+in a non-production environment before applying changes to production
+volumes. The pricing defaults are illustrative; verify against your AWS
+billing rates before relying on the financial impact figures.
