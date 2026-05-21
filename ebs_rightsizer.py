@@ -48,6 +48,8 @@ from botocore.exceptions import BotoCoreError, ClientError
 # Constants
 # ---------------------------------------------------------------------------
 
+__version__ = "1.5.0"
+
 GP3_BASELINE_IOPS = 3000
 GP3_BASELINE_THROUGHPUT = 125  # MiB/s
 
@@ -128,6 +130,7 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         description=__doc__,
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
+    p.add_argument("--version", action="version", version=f"ebs-rightsizer {__version__}")
     p.add_argument("--region", required=True, help="AWS region, e.g. us-east-1")
     p.add_argument("--profile", default=None, help="AWS CLI profile (optional)")
     p.add_argument("--days", type=int, default=30,
@@ -270,7 +273,7 @@ def boto_config() -> Config:
     # Adaptive retries handle Compute Optimizer + CloudWatch throttling cleanly.
     return Config(
         retries={"max_attempts": 10, "mode": "adaptive"},
-        user_agent_extra="ebs-rightsizer/1.0",
+        user_agent_extra=f"ebs-rightsizer/{__version__}",
     )
 
 
@@ -576,17 +579,21 @@ def sanitize_for_csv(value) -> str:
     return s
 
 
-def write_report(rows: List[VolumeReport], path: str) -> None:
+def write_report(rows: List[VolumeReport], path: str,
+                 manifest: Optional[Dict[str, object]] = None) -> None:
     """Write report. Format is selected by file extension:
        .xlsx -> styled Excel workbook (requires openpyxl)
        any other -> CSV
+
+    A `manifest` dict (run metadata) is emitted as a banner at the top of
+    the output for traceability.
     """
     if not rows:
         log.info("No rows to write.")
         return
     if path.lower().endswith(".xlsx"):
         try:
-            _write_xlsx(rows, path)
+            _write_xlsx(rows, path, manifest)
         except ImportError:
             log.error("openpyxl is required for .xlsx output. Install one of:")
             log.error("  Amazon Linux 2023:  sudo dnf install -y python3-openpyxl")
@@ -597,13 +604,53 @@ def write_report(rows: List[VolumeReport], path: str) -> None:
             log.error("  Or rerun with --output ending in .csv")
             sys.exit(2)
     else:
-        _write_csv(rows, path)
+        _write_csv(rows, path, manifest)
 
 
-def _write_csv(rows: List[VolumeReport], path: str) -> None:
+def _format_manifest_lines(manifest: Optional[Dict[str, object]]) -> List[str]:
+    """Format the run manifest into 2-3 short banner lines suitable for both
+    CSV header comments and an Excel summary section."""
+    if not manifest:
+        return []
+    line1 = (
+        f"Generated {manifest.get('generated_utc')} by "
+        f"{manifest.get('tool')} v{manifest.get('version')} | "
+        f"Account {manifest.get('account_id')} | "
+        f"Region {manifest.get('region')}"
+    )
+    line2 = (
+        f"Parameters: lookback={manifest.get('lookback_days')}d, "
+        f"buffer={manifest.get('buffer_pct')}%, "
+        f"floors={manifest.get('min_iops_floor')} IOPS / "
+        f"{manifest.get('min_throughput_floor')} MiB/s, "
+        f"gp3-only={manifest.get('gp3_only')}, "
+        f"direction={manifest.get('direction_filter')}, "
+        f"applied={manifest.get('applied')}"
+    )
+    pricing = manifest.get("pricing") or {}
+    if isinstance(pricing, dict):
+        line3 = (
+            f"Pricing (gp3 USD): storage=${pricing.get('storage_per_gib_month')}/GiB-mo, "
+            f"iops=${pricing.get('iops_per_iop_month_over_3000')}/IOP-mo over 3000, "
+            f"throughput=${pricing.get('throughput_per_mibps_month_over_125')}/MiB/s-mo over 125"
+        )
+    else:
+        line3 = ""
+    return [line1, line2, line3] if line3 else [line1, line2]
+
+
+def _write_csv(rows: List[VolumeReport], path: str,
+               manifest: Optional[Dict[str, object]] = None) -> None:
     fieldnames = list(rows[0].__dict__.keys())
     tmp_path = path + ".tmp"
     with open(tmp_path, "w", newline="", encoding="utf-8") as fh:
+        # Manifest banner as comment lines (RFC 4180 has no comment syntax,
+        # but '#' prefixed lines are universally ignored or trivially
+        # filtered downstream).
+        for line in _format_manifest_lines(manifest):
+            fh.write(f"# {line}\n")
+        if manifest:
+            fh.write("#\n")
         writer = csv.DictWriter(fh, fieldnames=fieldnames)
         writer.writeheader()
         for row in rows:
@@ -612,7 +659,8 @@ def _write_csv(rows: List[VolumeReport], path: str) -> None:
     log.info("Report written to %s (%d rows)", path, len(rows))
 
 
-def _write_xlsx(rows: List[VolumeReport], path: str) -> None:
+def _write_xlsx(rows: List[VolumeReport], path: str,
+                manifest: Optional[Dict[str, object]] = None) -> None:
     """Styled Excel workbook with frozen header, AutoFilter, currency format,
     color-coded direction, and visually distinct subtotal/total rows.
 
@@ -680,33 +728,51 @@ def _write_xlsx(rows: List[VolumeReport], path: str) -> None:
     thin = Side(border_style="thin", color="BFBFBF")
     cell_border = Border(left=thin, right=thin, top=thin, bottom=thin)
 
+    # --- Manifest banner (rows 1..N) ------------------------------------
+    manifest_lines = _format_manifest_lines(manifest)
+    banner_fill = PatternFill("solid", fgColor="EAEFF5")
+    banner_font = Font(name="Calibri", size=10, italic=True, color="1F4E78")
+    n_cols = len(headers)
+    last_col_letter = get_column_letter(n_cols)
+    for i, line in enumerate(manifest_lines, start=1):
+        ws.cell(row=i, column=1, value=line)
+        ws.merge_cells(start_row=i, start_column=1, end_row=i, end_column=n_cols)
+        for col_idx in range(1, n_cols + 1):
+            c = ws.cell(row=i, column=col_idx)
+            c.fill = banner_fill
+            c.font = banner_font
+            c.alignment = Alignment(horizontal="left", vertical="center", indent=1)
+        ws.row_dimensions[i].height = 18
+
+    header_row = len(manifest_lines) + 1
+
     # --- Header row -----------------------------------------------------
-    ws.append(headers)
-    for col_idx, _ in enumerate(headers, start=1):
-        cell = ws.cell(row=1, column=col_idx)
+    for col_idx, label in enumerate(headers, start=1):
+        cell = ws.cell(row=header_row, column=col_idx, value=label)
         cell.fill = header_fill
         cell.font = header_font
         cell.alignment = header_align
         cell.border = cell_border
-    ws.row_dimensions[1].height = 32
+    ws.row_dimensions[header_row].height = 32
 
     # --- Data rows ------------------------------------------------------
-    for r in rows:
+    first_data_row = header_row + 1
+    for offset, r in enumerate(rows):
+        ws_row_idx = first_data_row + offset
         record = r.__dict__
-        excel_row: List = []
-        for f in fieldnames:
+        for col_idx, f in enumerate(fieldnames, start=1):
             v = record[f]
             if v is None:
-                excel_row.append("")
+                cell_val: object = ""
             elif isinstance(v, str) and v and v[0] in CSV_INJECTION_TRIGGERS:
-                # Keep the injection guard for xlsx too — Excel evaluates =cell formulas
-                excel_row.append("'" + v)
+                cell_val = "'" + v
             else:
-                excel_row.append(v)
-        ws.append(excel_row)
+                cell_val = v
+            ws.cell(row=ws_row_idx, column=col_idx, value=cell_val)
 
     # --- Per-row styling -------------------------------------------------
-    for ws_row_idx, r in enumerate(rows, start=2):
+    for offset, r in enumerate(rows):
+        ws_row_idx = first_data_row + offset
         category = r.category
         action = r.action
         direction = r.direction
@@ -779,10 +845,10 @@ def _write_xlsx(rows: List[VolumeReport], path: str) -> None:
         ws.column_dimensions[get_column_letter(col_idx)].width = width_map.get(fname, 14)
 
     # --- Freeze header + AutoFilter -------------------------------------
-    ws.freeze_panes = "A2"
-    last_col = get_column_letter(len(fieldnames))
-    last_row = len(rows) + 1
-    ws.auto_filter.ref = f"A1:{last_col}{last_row}"
+    ws.freeze_panes = ws.cell(row=first_data_row, column=1).coordinate
+    last_col = last_col_letter
+    last_row = first_data_row + len(rows) - 1
+    ws.auto_filter.ref = f"A{header_row}:{last_col}{last_row}"
 
     # --- Atomic save ----------------------------------------------------
     tmp_path = path + ".tmp"
@@ -1145,7 +1211,30 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     sorted_rows = _sort_rows(rows)
     final_rows = _insert_subtotals(sorted_rows) if args.subtotals else sorted_rows
     output_path = _apply_timestamp(args.output, enabled=args.timestamp)
-    write_report(final_rows, output_path)
+
+    manifest = {
+        "tool": "ebs-rightsizer",
+        "version": __version__,
+        "generated_utc": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "account_id": account_id,
+        "region": args.region,
+        "lookback_days": args.days,
+        "buffer_pct": args.buffer,
+        "min_iops_floor": args.min_iops,
+        "min_throughput_floor": args.min_throughput,
+        "gp3_only": args.gp3_only,
+        "direction_filter": args.direction,
+        "include_orphans": args.include_orphans,
+        "orphans_only": args.orphans_only,
+        "applied": args.apply,
+        "pricing": pricing,
+        "row_counts": {
+            "total": len(final_rows),
+            "leaf_volumes": sum(1 for r in final_rows
+                                if r.category in ("rightsizing", "orphan")),
+        },
+    }
+    write_report(final_rows, output_path, manifest)
 
     # Summary
     counts = {"MODIFY": 0, "NO_CHANGE": 0, "SKIP": 0, "ORPHAN": 0}

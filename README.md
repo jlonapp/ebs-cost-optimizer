@@ -282,6 +282,26 @@ python3 ebs_rightsizer.py --region us-east-1 --apply --apply-all
 The script produces either a CSV (default) or a styled Excel workbook
 based on the file extension passed to `--output`.
 
+### Run manifest header
+
+Every report (CSV and XLSX) carries a manifest banner at the top with full
+run provenance:
+
+```
+Generated 2026-05-21T18:23:00Z by ebs-rightsizer v1.5.0 |
+Account 711457211352 | Region us-east-1
+Parameters: lookback=30d, buffer=20.0%, floors=3000 IOPS / 125 MiB/s,
+gp3-only=True, direction=both, applied=False
+Pricing (gp3 USD): storage=$0.08/GiB-mo, iops=$0.005/IOP-mo over 3000,
+throughput=$0.04/MiB/s-mo over 125
+```
+
+This makes a report self-describing: anyone receiving the file by email or
+in a ticket can see exactly which account, region, parameters, and pricing
+model produced it. In CSV, banner lines start with `#` so most tools ignore
+them by default. In XLSX, the banner sits in merged rows above the column
+headers.
+
 ### Output filename and timestamps
 
 Every report filename is automatically suffixed with a UTC timestamp so
