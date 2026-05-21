@@ -408,8 +408,12 @@ Requires `openpyxl` (see Prerequisites above for install commands).
 
 ## Security
 
-See [CONTRIBUTING.md#security-issue-notifications](CONTRIBUTING.md) for
-information about reporting vulnerabilities.
+See [SECURITY.md](SECURITY.md) for the full security posture mapped to the
+AWS Well-Architected Security Pillar (identity, access, detection, network,
+compute, data protection, input validation, and apply-path safeguards).
+
+For vulnerability reports, follow the AWS Vulnerability Reporting process
+described in [CONTRIBUTING.md](CONTRIBUTING.md#security-issue-notifications).
 
 ## License
 

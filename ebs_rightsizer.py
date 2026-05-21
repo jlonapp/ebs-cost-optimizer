@@ -48,7 +48,7 @@ from botocore.exceptions import BotoCoreError, ClientError
 # Constants
 # ---------------------------------------------------------------------------
 
-__version__ = "1.5.0"
+__version__ = "1.6.0"
 
 GP3_BASELINE_IOPS = 3000
 GP3_BASELINE_THROUGHPUT = 125  # MiB/s
@@ -235,8 +235,17 @@ def load_volume_id_scope(args: argparse.Namespace) -> Optional[List[str]]:
     if args.volume_ids:
         ids.extend(args.volume_ids)
     if args.volume_ids_file:
+        scope_path = os.path.abspath(args.volume_ids_file)
+        if os.path.islink(args.volume_ids_file):
+            log.error("--volume-ids-file must not be a symlink: %s", args.volume_ids_file)
+            sys.exit(2)
         try:
-            with open(args.volume_ids_file, "r", encoding="utf-8") as fh:
+            st = os.stat(scope_path)
+            # 1 MiB cap (well above any plausible volume list)
+            if st.st_size > 1024 * 1024:
+                log.error("--volume-ids-file too large (%d bytes); refusing to read", st.st_size)
+                sys.exit(2)
+            with open(scope_path, "r", encoding="utf-8") as fh:
                 for line in fh:
                     line = line.strip()
                     if line and not line.startswith("#"):
@@ -247,6 +256,13 @@ def load_volume_id_scope(args: argparse.Namespace) -> Optional[List[str]]:
 
     if not ids:
         return None
+
+    # Hard cap on volumes-per-run to prevent runaway API usage
+    MAX_SCOPE = 5000
+    if len(ids) > MAX_SCOPE:
+        log.error("Volume scope too large (%d > %d). Split into multiple runs.",
+                  len(ids), MAX_SCOPE)
+        sys.exit(2)
 
     cleaned: List[str] = []
     seen = set()
@@ -266,13 +282,31 @@ def load_volume_id_scope(args: argparse.Namespace) -> Optional[List[str]]:
 # ---------------------------------------------------------------------------
 
 def build_session(profile: Optional[str], region: str) -> boto3.Session:
+    """Build a boto3 session.
+
+    Credential precedence is the standard boto3 chain (env vars, shared
+    credentials file, EC2 instance role, ECS task role, SSO, etc).
+    The script never accepts credentials via CLI flags so they cannot leak
+    into shell history or process listings.
+    """
     return boto3.Session(profile_name=profile, region_name=region)
 
 
 def boto_config() -> Config:
-    # Adaptive retries handle Compute Optimizer + CloudWatch throttling cleanly.
+    """boto3 client config with security best practices baked in.
+
+    - Adaptive retries with capped attempts so a misbehaving service doesn't
+      generate unbounded API calls.
+    - Connection/read timeouts so a hung endpoint can't block the script.
+    - User agent identifies the tool and version for AWS Support traceability.
+    - Default endpoint regional (no global endpoints).
+    - TLS validation stays on (botocore default); the script never disables it.
+    """
     return Config(
         retries={"max_attempts": 10, "mode": "adaptive"},
+        connect_timeout=10,
+        read_timeout=60,
+        max_pool_connections=20,
         user_agent_extra=f"ebs-rightsizer/{__version__}",
     )
 
@@ -492,24 +526,48 @@ def load_pricing(args: argparse.Namespace) -> Dict[str, float]:
     """Resolve gp3 pricing in this order: defaults <- pricing file <- CLI overrides."""
     pricing = dict(DEFAULT_PRICING_GP3)
     if args.pricing_file:
+        pricing_path = os.path.abspath(args.pricing_file)
         try:
-            with open(args.pricing_file, "r", encoding="utf-8") as fh:
+            # Reject symlinks to avoid following a maliciously placed link
+            # to an arbitrary file the user can't otherwise read.
+            if os.path.islink(args.pricing_file):
+                log.error("--pricing-file must not be a symlink: %s", args.pricing_file)
+                sys.exit(2)
+            st = os.stat(pricing_path)
+            # Cap input size — a 1 MiB JSON pricing file is more than generous.
+            if st.st_size > 1024 * 1024:
+                log.error("--pricing-file too large (%d bytes); refusing to read", st.st_size)
+                sys.exit(2)
+            with open(pricing_path, "r", encoding="utf-8") as fh:
                 data = json.load(fh)
         except (OSError, json.JSONDecodeError) as exc:
             log.error("Cannot read --pricing-file: %s", exc)
             sys.exit(2)
+        if not isinstance(data, dict):
+            log.error("--pricing-file must contain a JSON object at top level")
+            sys.exit(2)
         for key in pricing:
             if key in data:
                 try:
-                    pricing[key] = float(data[key])
+                    val = float(data[key])
                 except (TypeError, ValueError):
                     log.error("Pricing file key %r must be numeric", key)
                     sys.exit(2)
+                if val < 0:
+                    log.error("Pricing file key %r must be non-negative", key)
+                    sys.exit(2)
+                pricing[key] = val
     if args.price_storage is not None:
+        if args.price_storage < 0:
+            log.error("--price-storage must be non-negative"); sys.exit(2)
         pricing["storage_per_gib_month"] = args.price_storage
     if args.price_iops is not None:
+        if args.price_iops < 0:
+            log.error("--price-iops must be non-negative"); sys.exit(2)
         pricing["iops_per_iop_month_over_3000"] = args.price_iops
     if args.price_throughput is not None:
+        if args.price_throughput < 0:
+            log.error("--price-throughput must be non-negative"); sys.exit(2)
         pricing["throughput_per_mibps_month_over_125"] = args.price_throughput
     return pricing
 
@@ -639,14 +697,28 @@ def _format_manifest_lines(manifest: Optional[Dict[str, object]]) -> List[str]:
     return [line1, line2, line3] if line3 else [line1, line2]
 
 
+def _atomic_save(tmp_path: str, final_path: str) -> None:
+    """Atomically rename and tighten permissions to user-only read/write (0600).
+
+    Reports may include volume IDs and instance IDs which are not secrets but
+    are sensitive operational metadata. Restricting to the running user is a
+    defense-in-depth move that costs nothing and matches AWS sample-code
+    guidance for files written by automation.
+    """
+    os.replace(tmp_path, final_path)
+    try:
+        os.chmod(final_path, 0o600)
+    except OSError as exc:
+        log.warning("Could not chmod 0600 on %s: %s", final_path, exc)
+
+
 def _write_csv(rows: List[VolumeReport], path: str,
                manifest: Optional[Dict[str, object]] = None) -> None:
     fieldnames = list(rows[0].__dict__.keys())
     tmp_path = path + ".tmp"
-    with open(tmp_path, "w", newline="", encoding="utf-8") as fh:
-        # Manifest banner as comment lines (RFC 4180 has no comment syntax,
-        # but '#' prefixed lines are universally ignored or trivially
-        # filtered downstream).
+    # Open with explicit mode so umask leaks don't widen perms before chmod.
+    fd = os.open(tmp_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w", newline="", encoding="utf-8") as fh:
         for line in _format_manifest_lines(manifest):
             fh.write(f"# {line}\n")
         if manifest:
@@ -655,7 +727,7 @@ def _write_csv(rows: List[VolumeReport], path: str,
         writer.writeheader()
         for row in rows:
             writer.writerow({k: sanitize_for_csv(v) for k, v in row.__dict__.items()})
-    os.replace(tmp_path, path)
+    _atomic_save(tmp_path, path)
     log.info("Report written to %s (%d rows)", path, len(rows))
 
 
@@ -853,7 +925,7 @@ def _write_xlsx(rows: List[VolumeReport], path: str,
     # --- Atomic save ----------------------------------------------------
     tmp_path = path + ".tmp"
     wb.save(tmp_path)
-    os.replace(tmp_path, path)
+    _atomic_save(tmp_path, path)
     log.info("Report written to %s (%d rows, styled xlsx)", path, len(rows))
 
 
@@ -1154,10 +1226,16 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     session = build_session(args.profile, args.region)
     try:
         sts = session.client("sts", config=cfg)
-        account_id = sts.get_caller_identity()["Account"]
+        identity = sts.get_caller_identity()
+        account_id = identity["Account"]
+        principal_arn = identity.get("Arn", "(unknown)")
     except (ClientError, BotoCoreError) as exc:
         log.error("Could not resolve AWS identity: %s", exc)
         return 1
+
+    # Audit trail: log the calling principal so operators can correlate runs
+    # with CloudTrail later. Account ID and ARN are not secrets.
+    log.info("Authenticated as %s", principal_arn)
 
     log.info(
         "Account=%s region=%s lookback=%dd buffer=%.1f%% apply=%s orphans=%s",
