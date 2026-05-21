@@ -169,6 +169,40 @@ Rows are sorted by `attached_instances` so all volumes on the same EC2
 instance group together. Within an instance, rows are sorted by `volume_id`
 for deterministic output. Orphan (unattached) volumes appear at the bottom.
 
+### Per-instance subtotals (default ON)
+
+After each instance's volume group, a `SUBTOTAL` row rolls up:
+
+- `monthly_cost_current_usd` (sum)
+- `monthly_cost_target_usd` (sum)
+- `monthly_delta_usd` (sum, negative = savings)
+- `annual_delta_usd` (sum × 12)
+
+Orphan volumes get a single combined `ORPHAN_SUBTOTAL` row, and a final
+`GRAND_TOTAL` row sums the entire report. The `volume_id` column carries
+the literal string `SUBTOTAL`, `ORPHAN_SUBTOTAL`, or `GRAND_TOTAL` so they
+are trivial to filter or pivot in Excel.
+
+To disable totals (e.g., for downstream tooling that only wants leaf rows):
+
+```bash
+python ebs_rightsizer.py --region us-east-1 --no-subtotals
+```
+
+Sample with subtotals:
+
+```
+volume_id,...,attached_instances,...,monthly_delta_usd,annual_delta_usd,...
+vol-bbbb...,...,i-aaaa,...,-15.00,-180.00,...
+vol-cccc...,...,i-aaaa,...,0.00,0.00,...
+SUBTOTAL,...,i-aaaa,...,-15.00,-180.00,...
+vol-aaaa...,...,i-bbbb,...,-50.00,-600.00,...
+SUBTOTAL,...,i-bbbb,...,-50.00,-600.00,...
+vol-dddd...,...,,...,-4.00,-48.00,...
+ORPHAN_SUBTOTAL,...,(orphan),...,-4.00,-48.00,...
+GRAND_TOTAL,...,,...,-69.00,-828.00,...
+```
+
 ## Apply safety model
 
 - `--apply` alone is rejected. You must combine it with **either**
@@ -192,6 +226,7 @@ for deterministic output. Orphan (unattached) volumes appear at the bottom.
 | `--min-throughput` | 125 | Floor for throughput MiB/s (never goes below) |
 | `--max-workers` | 8 | Parallel CloudWatch threads |
 | `--output` | `ebs_rightsizing_report.csv` | Report path |
+| `--no-subtotals` | off (subtotals on) | Disable per-instance subtotal rows |
 | `--pricing-file` | none | JSON file with gp3 prices (see Pricing) |
 | `--price-storage` | 0.08 | Override $/GiB-month |
 | `--price-iops` | 0.005 | Override $/IOP-month above 3000 |

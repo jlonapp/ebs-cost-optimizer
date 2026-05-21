@@ -142,6 +142,8 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
                    help=f"Parallel CloudWatch workers (default {DEFAULT_MAX_WORKERS})")
     p.add_argument("--output", default="ebs_rightsizing_report.csv",
                    help="CSV report output path")
+    p.add_argument("--no-subtotals", dest="subtotals", action="store_false", default=True,
+                   help="Disable per-instance subtotal rows (default ON)")
 
     # Pricing (gp3)
     p.add_argument("--pricing-file",
@@ -935,7 +937,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             if r.action.startswith("MODIFY"):
                 r.modification_state = "DRY_RUN"
 
-    write_report(_sort_rows(rows), args.output)
+    sorted_rows = _sort_rows(rows)
+    final_rows = _insert_subtotals(sorted_rows) if args.subtotals else sorted_rows
+    write_report(final_rows, args.output)
 
     # Summary
     counts = {"MODIFY": 0, "NO_CHANGE": 0, "SKIP": 0, "ORPHAN": 0}
@@ -984,6 +988,98 @@ def _sort_rows(rows: List[VolumeReport]) -> List[VolumeReport]:
             r.volume_id,
         ),
     )
+
+
+def _insert_subtotals(rows: List[VolumeReport]) -> List[VolumeReport]:
+    """Insert one subtotal row after each instance's volume group, plus a
+    final ORPHAN_TOTAL and GRAND_TOTAL. Assumes `rows` is already sorted by
+    instance via _sort_rows()."""
+    if not rows:
+        return rows
+
+    out: List[VolumeReport] = []
+    cur_instance: Optional[str] = None
+    bucket: List[VolumeReport] = []
+    grand_current = 0.0
+    grand_target = 0.0
+    grand_delta = 0.0
+
+    def flush_bucket() -> None:
+        if not bucket:
+            return
+        instance = bucket[0].attached_instances
+        # Orphans get one combined subtotal labelled differently
+        is_orphan_bucket = bucket[0].category == "orphan"
+        cur_sum = round(sum(r.monthly_cost_current_usd for r in bucket), 2)
+        tgt_sum = round(sum(r.monthly_cost_target_usd for r in bucket), 2)
+        delta_sum = round(sum(r.monthly_delta_usd for r in bucket), 2)
+        annual_sum = round(delta_sum * 12, 2)
+        label = "ORPHAN_SUBTOTAL" if is_orphan_bucket else "SUBTOTAL"
+        instance_label = "(orphan)" if is_orphan_bucket else instance
+        out.extend(bucket)
+        out.append(VolumeReport(
+            volume_id=label,
+            volume_type="",
+            size_gib=0,
+            state="",
+            attached_instances=instance_label,
+            create_time="",
+            current_iops=0,
+            current_throughput_mibps=0,
+            peak_iops=0.0,
+            peak_throughput_mibps=0.0,
+            target_iops=None,
+            target_throughput_mibps=None,
+            direction="",
+            action=f"{label} ({len(bucket)} volume(s))",
+            monthly_cost_current_usd=cur_sum,
+            monthly_cost_target_usd=tgt_sum,
+            monthly_delta_usd=delta_sum,
+            annual_delta_usd=annual_sum,
+            category="subtotal",
+            notes="",
+        ))
+
+    for r in rows:
+        # Determine bucket key: instance for rightsizing rows, single
+        # "(orphan)" bucket for all orphans collectively.
+        key = "(orphan)" if r.category == "orphan" else r.attached_instances
+        if cur_instance is None:
+            cur_instance = key
+        if key != cur_instance:
+            flush_bucket()
+            bucket = []
+            cur_instance = key
+        bucket.append(r)
+        grand_current += r.monthly_cost_current_usd
+        grand_target += r.monthly_cost_target_usd
+        grand_delta += r.monthly_delta_usd
+    flush_bucket()
+
+    # Final grand total
+    out.append(VolumeReport(
+        volume_id="GRAND_TOTAL",
+        volume_type="",
+        size_gib=0,
+        state="",
+        attached_instances="",
+        create_time="",
+        current_iops=0,
+        current_throughput_mibps=0,
+        peak_iops=0.0,
+        peak_throughput_mibps=0.0,
+        target_iops=None,
+        target_throughput_mibps=None,
+        direction="",
+        action=f"GRAND_TOTAL ({len(rows)} volume(s))",
+        monthly_cost_current_usd=round(grand_current, 2),
+        monthly_cost_target_usd=round(grand_target, 2),
+        monthly_delta_usd=round(grand_delta, 2),
+        annual_delta_usd=round(grand_delta * 12, 2),
+        category="total",
+        notes="",
+    ))
+    return out
 
 
 if __name__ == "__main__":
