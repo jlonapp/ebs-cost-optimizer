@@ -583,8 +583,13 @@ def write_report(rows: List[VolumeReport], path: str) -> None:
         try:
             _write_xlsx(rows, path)
         except ImportError:
-            log.error("openpyxl is required for .xlsx output. "
-                      "Install with: pip3 install openpyxl  (or rerun with --output ending in .csv)")
+            log.error("openpyxl is required for .xlsx output. Install one of:")
+            log.error("  Amazon Linux 2023:  sudo dnf install -y python3-openpyxl")
+            log.error("  Amazon Linux 2:     sudo yum install -y python3-openpyxl")
+            log.error("  Debian/Ubuntu:      sudo apt-get install -y python3-openpyxl")
+            log.error("  RHEL/CentOS:        sudo yum install -y python3-openpyxl")
+            log.error("  macOS / generic:    pip3 install --user openpyxl")
+            log.error("  Or rerun with --output ending in .csv")
             sys.exit(2)
     else:
         _write_csv(rows, path)
