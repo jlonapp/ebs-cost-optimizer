@@ -1,5 +1,7 @@
 # Generated report output
-ebs_rightsizing_report.csv
+EBS_Cost_Optimization*.csv
+EBS_Cost_Optimization*.xlsx
+ebs_rightsizing_report*.csv
 *.csv
 *.xlsx
 !sample_report.xlsx

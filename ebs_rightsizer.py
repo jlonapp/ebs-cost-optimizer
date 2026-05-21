@@ -48,7 +48,7 @@ from botocore.exceptions import BotoCoreError, ClientError
 # Constants
 # ---------------------------------------------------------------------------
 
-__version__ = "1.6.0"
+__version__ = "1.7.0"
 
 GP3_BASELINE_IOPS = 3000
 GP3_BASELINE_THROUGHPUT = 125  # MiB/s
@@ -143,10 +143,11 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
                    help=f"Floor for throughput MiB/s (default {GP3_BASELINE_THROUGHPUT})")
     p.add_argument("--max-workers", type=int, default=DEFAULT_MAX_WORKERS,
                    help=f"Parallel CloudWatch workers (default {DEFAULT_MAX_WORKERS})")
-    p.add_argument("--output", default="ebs_rightsizing_report.csv",
-                   help="Report path. Use .xlsx extension for styled Excel output. "
-                        "By default a UTC timestamp is inserted before the extension "
-                        "(e.g. report.xlsx -> report_20260521T182300Z.xlsx). "
+    p.add_argument("--output", default="EBS_Cost_Optimization.xlsx",
+                   help="Report path. Use .xlsx for styled Excel (default), "
+                        ".csv for plain text. By default a UTC date and time "
+                        "is inserted before the extension "
+                        "(e.g. EBS_Cost_Optimization_2026-05-21_18-23-00Z.xlsx). "
                         "Use {ts} as a placeholder for explicit positioning.")
     p.add_argument("--no-timestamp", dest="timestamp", action="store_false", default=True,
                    help="Disable automatic timestamp insertion in the output filename")
@@ -1363,7 +1364,9 @@ def _apply_timestamp(path: str, enabled: bool) -> str:
     """
     if not enabled:
         return path
-    ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    # Human-readable but still lexically sortable. Hyphens in the date,
+    # hyphens in the time so it's safe on Windows filesystems too (no ':').
+    ts = datetime.now(timezone.utc).strftime("%Y-%m-%d_%H-%M-%SZ")
     if "{ts}" in path:
         return path.replace("{ts}", ts)
     base, ext = os.path.splitext(path)

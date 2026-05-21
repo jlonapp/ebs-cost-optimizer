@@ -259,7 +259,7 @@ python3 ebs_rightsizer.py --region us-east-1 --apply --apply-all
 | `--min-iops` | 3000 | Floor for IOPS (gp3 baseline) |
 | `--min-throughput` | 125 | Floor for throughput MiB/s |
 | `--max-workers` | 8 | Parallel CloudWatch threads |
-| `--output` | `ebs_rightsizing_report.csv` | Report path. Use `.xlsx` for styled Excel |
+| `--output` | `EBS_Cost_Optimization.xlsx` | Report path. Use `.xlsx` for styled Excel (default), `.csv` for plain text |
 | `--no-timestamp` | off (timestamps on) | Disable UTC timestamp suffix in filename |
 | `--no-subtotals` | off (subtotals on) | Disable per-instance subtotal rows |
 | `--pricing-file` | none | JSON file with gp3 prices |
@@ -288,7 +288,7 @@ Every report (CSV and XLSX) carries a manifest banner at the top with full
 run provenance:
 
 ```
-Generated 2026-05-21T18:23:00Z by ebs-rightsizer v1.5.0 |
+Generated 2026-05-21T18:23:00Z by ebs-rightsizer v1.7.0 |
 Account 711457211352 | Region us-east-1
 Parameters: lookback=30d, buffer=20.0%, floors=3000 IOPS / 125 MiB/s,
 gp3-only=True, direction=both, applied=False
@@ -304,36 +304,39 @@ headers.
 
 ### Output filename and timestamps
 
-Every report filename is automatically suffixed with a UTC timestamp so
-runs never overwrite each other and chronological sorting works
-correctly:
+By default, every run produces a uniquely named workbook in the form
+`EBS_Cost_Optimization_<UTC date>_<UTC time>Z.<ext>`:
 
 ```
-report.xlsx              ->  report_20260521T182300Z.xlsx
-ebs_rightsizing_report.csv -> ebs_rightsizing_report_20260521T182300Z.csv
-reports/q2-audit.csv     ->  reports/q2-audit_20260521T182300Z.csv
+EBS_Cost_Optimization.xlsx       ->  EBS_Cost_Optimization_2026-05-21_18-23-00Z.xlsx
+EBS_Cost_Optimization.csv        ->  EBS_Cost_Optimization_2026-05-21_18-23-00Z.csv
+reports/q2-audit.xlsx            ->  reports/q2-audit_2026-05-21_18-23-00Z.xlsx
 ```
+
+The format is human-readable, lexically sortable, and Windows-safe (no `:`).
 
 For explicit positioning, use the `{ts}` placeholder:
 ```bash
 python3 ebs_rightsizer.py --region us-east-1 --output snapshot_{ts}.xlsx
-# -> snapshot_20260521T182300Z.xlsx
+# -> snapshot_2026-05-21_18-23-00Z.xlsx
 ```
 
 To disable timestamping (overwrite same filename each run):
 ```bash
-python3 ebs_rightsizer.py --region us-east-1 --no-timestamp --output report.csv
+python3 ebs_rightsizer.py --region us-east-1 --no-timestamp \
+    --output EBS_Cost_Optimization.csv
 ```
 
-### CSV (default)
+### CSV
 
 Plain text, suitable for downstream tooling, scripting, and version control.
 
 ```bash
-python3 ebs_rightsizer.py --region us-east-1 --output report.csv
+python3 ebs_rightsizer.py --region us-east-1 \
+    --output EBS_Cost_Optimization.csv
 ```
 
-### Styled Excel workbook (.xlsx)
+### Styled Excel workbook (.xlsx, default)
 
 Professional-grade workbook with frozen header, AutoFilter on every column,
 USD currency formatting (negative values in red), color-coded direction
@@ -341,7 +344,8 @@ USD currency formatting (negative values in red), color-coded direction
 visually distinct SUBTOTAL (pale blue) and GRAND_TOTAL (navy) rows.
 
 ```bash
-python3 ebs_rightsizer.py --region us-east-1 --output report.xlsx
+python3 ebs_rightsizer.py --region us-east-1
+# -> EBS_Cost_Optimization_2026-05-21_18-23-00Z.xlsx
 ```
 
 Requires `openpyxl` (see Prerequisites above for install commands).
