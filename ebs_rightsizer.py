@@ -572,9 +572,25 @@ def sanitize_for_csv(value) -> str:
 
 
 def write_report(rows: List[VolumeReport], path: str) -> None:
+    """Write report. Format is selected by file extension:
+       .xlsx -> styled Excel workbook (requires openpyxl)
+       any other -> CSV
+    """
     if not rows:
         log.info("No rows to write.")
         return
+    if path.lower().endswith(".xlsx"):
+        try:
+            _write_xlsx(rows, path)
+        except ImportError:
+            log.error("openpyxl is required for .xlsx output. "
+                      "Install with: pip3 install openpyxl  (or rerun with --output ending in .csv)")
+            sys.exit(2)
+    else:
+        _write_csv(rows, path)
+
+
+def _write_csv(rows: List[VolumeReport], path: str) -> None:
     fieldnames = list(rows[0].__dict__.keys())
     tmp_path = path + ".tmp"
     with open(tmp_path, "w", newline="", encoding="utf-8") as fh:
@@ -584,6 +600,185 @@ def write_report(rows: List[VolumeReport], path: str) -> None:
             writer.writerow({k: sanitize_for_csv(v) for k, v in row.__dict__.items()})
     os.replace(tmp_path, path)
     log.info("Report written to %s (%d rows)", path, len(rows))
+
+
+def _write_xlsx(rows: List[VolumeReport], path: str) -> None:
+    """Styled Excel workbook with frozen header, AutoFilter, currency format,
+    color-coded direction, and visually distinct subtotal/total rows.
+
+    Headers are formatted as Title Case with spaces (e.g. "Volume Id") for
+    presentation; the underlying field order matches the CSV exactly so any
+    downstream tooling can switch between formats.
+    """
+    from openpyxl import Workbook
+    from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
+    from openpyxl.utils import get_column_letter
+
+    fieldnames = list(rows[0].__dict__.keys())
+
+    # Pretty header labels
+    def humanize(name: str) -> str:
+        # special-cased units we want preserved
+        replacements = {
+            "iops": "IOPS",
+            "mibps": "MiB/s",
+            "usd": "USD",
+            "gib": "GiB",
+            "id": "ID",
+        }
+        parts = name.split("_")
+        out: List[str] = []
+        for p in parts:
+            out.append(replacements.get(p, p.capitalize()))
+        return " ".join(out)
+
+    headers = [humanize(f) for f in fieldnames]
+
+    # Columns we want formatted as currency
+    currency_cols = {
+        "monthly_cost_current_usd",
+        "monthly_cost_target_usd",
+        "monthly_delta_usd",
+        "annual_delta_usd",
+    }
+    # Columns we want as integers
+    integer_cols = {"size_gib", "current_iops", "current_throughput_mibps",
+                    "target_iops", "target_throughput_mibps"}
+    # Columns we want as numbers with 2 decimal places
+    decimal_cols = {"peak_iops", "peak_throughput_mibps"}
+
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "EBS Right-Sizing"
+
+    # --- Style palette --------------------------------------------------
+    header_fill = PatternFill("solid", fgColor="1F4E78")    # AWS-ish navy
+    header_font = Font(name="Calibri", size=11, bold=True, color="FFFFFF")
+    header_align = Alignment(horizontal="center", vertical="center", wrap_text=True)
+
+    subtotal_fill = PatternFill("solid", fgColor="D9E1F2")  # pale blue
+    subtotal_font = Font(name="Calibri", size=11, bold=True, color="1F4E78")
+
+    grand_fill = PatternFill("solid", fgColor="1F4E78")     # navy
+    grand_font = Font(name="Calibri", size=11, bold=True, color="FFFFFF")
+
+    upsize_fill = PatternFill("solid", fgColor="FFF2CC")    # warm yellow
+    downsize_fill = PatternFill("solid", fgColor="E2EFDA")  # soft green
+    orphan_fill = PatternFill("solid", fgColor="FCE4D6")    # peach
+    skip_fill = PatternFill("solid", fgColor="F2F2F2")      # neutral grey
+
+    thin = Side(border_style="thin", color="BFBFBF")
+    cell_border = Border(left=thin, right=thin, top=thin, bottom=thin)
+
+    # --- Header row -----------------------------------------------------
+    ws.append(headers)
+    for col_idx, _ in enumerate(headers, start=1):
+        cell = ws.cell(row=1, column=col_idx)
+        cell.fill = header_fill
+        cell.font = header_font
+        cell.alignment = header_align
+        cell.border = cell_border
+    ws.row_dimensions[1].height = 32
+
+    # --- Data rows ------------------------------------------------------
+    for r in rows:
+        record = r.__dict__
+        excel_row: List = []
+        for f in fieldnames:
+            v = record[f]
+            if v is None:
+                excel_row.append("")
+            elif isinstance(v, str) and v and v[0] in CSV_INJECTION_TRIGGERS:
+                # Keep the injection guard for xlsx too — Excel evaluates =cell formulas
+                excel_row.append("'" + v)
+            else:
+                excel_row.append(v)
+        ws.append(excel_row)
+
+    # --- Per-row styling -------------------------------------------------
+    for ws_row_idx, r in enumerate(rows, start=2):
+        category = r.category
+        action = r.action
+        direction = r.direction
+
+        # Pick row tint
+        if category == "total":
+            row_fill = grand_fill
+            row_font = grand_font
+        elif category == "subtotal":
+            row_fill = subtotal_fill
+            row_font = subtotal_font
+        elif category == "orphan":
+            row_fill = orphan_fill
+            row_font = None
+        elif action.startswith("SKIP") or action.startswith("NO_CHANGE"):
+            row_fill = skip_fill
+            row_font = None
+        elif direction == "UPSIZE":
+            row_fill = upsize_fill
+            row_font = None
+        elif direction == "DOWNSIZE":
+            row_fill = downsize_fill
+            row_font = None
+        else:
+            row_fill = None
+            row_font = None
+
+        for col_idx, fname in enumerate(fieldnames, start=1):
+            cell = ws.cell(row=ws_row_idx, column=col_idx)
+            cell.border = cell_border
+            if row_fill is not None:
+                cell.fill = row_fill
+            if row_font is not None:
+                cell.font = row_font
+
+            # Number formatting per column type
+            if fname in currency_cols:
+                cell.number_format = '"$"#,##0.00;[Red]-"$"#,##0.00'
+            elif fname in integer_cols:
+                cell.number_format = "#,##0"
+            elif fname in decimal_cols:
+                cell.number_format = "#,##0.00"
+
+    # --- Column widths --------------------------------------------------
+    width_map = {
+        "volume_id": 26,
+        "volume_type": 11,
+        "size_gib": 9,
+        "state": 11,
+        "attached_instances": 22,
+        "create_time": 24,
+        "current_iops": 12,
+        "current_throughput_mibps": 14,
+        "peak_iops": 12,
+        "peak_throughput_mibps": 14,
+        "target_iops": 12,
+        "target_throughput_mibps": 14,
+        "direction": 11,
+        "action": 38,
+        "monthly_cost_current_usd": 16,
+        "monthly_cost_target_usd": 16,
+        "monthly_delta_usd": 14,
+        "annual_delta_usd": 14,
+        "modification_state": 18,
+        "co_finding_reasons": 32,
+        "category": 12,
+        "notes": 32,
+    }
+    for col_idx, fname in enumerate(fieldnames, start=1):
+        ws.column_dimensions[get_column_letter(col_idx)].width = width_map.get(fname, 14)
+
+    # --- Freeze header + AutoFilter -------------------------------------
+    ws.freeze_panes = "A2"
+    last_col = get_column_letter(len(fieldnames))
+    last_row = len(rows) + 1
+    ws.auto_filter.ref = f"A1:{last_col}{last_row}"
+
+    # --- Atomic save ----------------------------------------------------
+    tmp_path = path + ".tmp"
+    wb.save(tmp_path)
+    os.replace(tmp_path, path)
+    log.info("Report written to %s (%d rows, styled xlsx)", path, len(rows))
 
 
 # ---------------------------------------------------------------------------

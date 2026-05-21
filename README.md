@@ -237,6 +237,32 @@ python3 ebs_rightsizer.py --region us-east-1 --apply --apply-all
 | `--apply-all` | off | Required for `--apply` without an ID list |
 | `--yes` | off | Skip interactive confirm prompt |
 
+## Output formats
+
+The script produces either a CSV (default) or a styled Excel workbook
+based on the file extension passed to `--output`.
+
+### CSV (default)
+
+Plain text, suitable for downstream tooling, scripting, and version control.
+
+```bash
+python3 ebs_rightsizer.py --region us-east-1 --output report.csv
+```
+
+### Styled Excel workbook (.xlsx)
+
+Professional-grade workbook with frozen header, AutoFilter on every column,
+USD currency formatting (negative values in red), color-coded direction
+(green=downsize, yellow=upsize, peach=orphan, grey=no-change/skip), and
+visually distinct SUBTOTAL (pale blue) and GRAND_TOTAL (navy) rows.
+
+```bash
+python3 ebs_rightsizer.py --region us-east-1 --output report.xlsx
+```
+
+Requires `openpyxl` (already in `requirements.txt`).
+
 ## Output schema
 
 | Column | Description |

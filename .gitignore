@@ -22,3 +22,6 @@ venv/
 
 # Temp files from atomic writes
 *.tmp
+
+# Sample workbook artifacts (regenerated on demand)
+sample_report.xlsx
